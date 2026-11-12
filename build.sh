@@ -9,6 +9,7 @@ DOTNET_VERSION="9.0.318"
 GDRE_VERSION="2.7.0"
 FMOD_GDE_VERSION="6.1.0-4.5.0"
 SPINE_VERSION="4.2"
+GO_VERSION="1.27.2"
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 BUILD="$ROOT/build"
@@ -250,6 +251,12 @@ if [[ ! -f "$TOOLS/spine/.ok-$SPINE_VERSION-$GODOT_VERSION" ]]; then
 	rm -rf "$TOOLS/spine-zip"
 	touch "$TOOLS/spine/.ok-$SPINE_VERSION-$GODOT_VERSION"
 fi
+if [[ ! -x "$TOOLS/go/bin/go" || "$("$TOOLS/go/bin/go" env GOVERSION 2>/dev/null)" != "go$GO_VERSION" ]]; then
+	step "Downloading Go $GO_VERSION"
+	rm -rf "$TOOLS/go"
+	fetch "https://go.dev/dl/go$GO_VERSION.darwin-$([[ "$(uname -m)" == arm64 ]] && echo arm64 || echo amd64).tar.gz" "$TOOLS/go.tar.gz"
+	run go-untar tar -xzf "$TOOLS/go.tar.gz" -C "$TOOLS" && rm "$TOOLS/go.tar.gz"
+fi
 # The prebuilt spine-godot GDExtension reads every re-created mesh back from the GPU (RenderingServer.mesh_get_surface,
 # which waits for all frames in flight): a 30-40 ms freeze on an iPhone whenever an attack or hit animation changes a
 # mesh. Rebuild its iOS library from the same 4.2 sources with src/spine/no-gpu-readback.patch.
@@ -477,6 +484,24 @@ nearby_object() { # <sdk> <target> -> prints the object's path
 	fi
 	echo "$o"
 }
+# Multiplayer from anywhere over Tailcat (src/ios/tailcat/tailcat_play.go). Go, built as a static library and
+# force-loaded: nothing in the app refers to it, PortTailcat.cs looks its functions up at run time.
+tailcat_library() { # <sdk> <clang target> -> prints the linker flag
+	local a="$WORK/tailcat_play-$1-$(fingerprint "$ROOT/src/ios/tailcat" "$GO_VERSION" | cut -c1-12).a"
+	if [[ ! -f "$a" ]]; then
+		rm -f "$WORK"/tailcat_play-"$1"-*.a
+		local go="$TOOLS/go/bin/go" tags
+		export GOROOT="$TOOLS/go" GOPATH="$TOOLS/go-path" GOCACHE="$TOOLS/go-cache" GOTOOLCHAIN=local GOFLAGS=-mod=readonly
+		cd "$ROOT/src/ios/tailcat"
+		run tailcat-mod "$go" mod download github.com/tailscale/tailcat >&2
+		tags="$(cat "$("$go" list -m -f '{{.Dir}}' github.com/tailscale/tailcat)/build-tags.txt")"
+		CGO_ENABLED=1 GOOS=ios GOARCH=arm64 CC="$(xcrun -sdk "$1" -f clang) -isysroot $(xcrun -sdk "$1" --show-sdk-path) -target $2" \
+			run "tailcat-$1" "$go" build -trimpath -buildvcs=false -tags "$tags" -ldflags='-s -w' -buildmode=c-archive -o "$a" . >&2
+		rm -f "${a%.a}.h"
+	fi
+	echo "-Wl,-force_load,$a"
+}
+TAILCAT_LDFLAGS='-framework CoreFoundation -framework Security -lresolv'
 NEARBY_LDFLAGS='-L$(SDKROOT)/usr/lib/swift -L$(TOOLCHAIN_DIR)/usr/lib/swift/$(PLATFORM_NAME) -weak_framework WiFiAware -weak_framework DeviceDiscoveryUI'
 
 # ---------------------------------------------------------------------------------------------------- Simulator
@@ -513,11 +538,11 @@ if [[ $SIM -eq 1 ]]; then
 	run sim-retag python3 "$ROOT/tools/arm64_to_sim.py" "$G"
 	run sim-metal xcrun -sdk iphonesimulator clang -arch arm64 -mios-simulator-version-min=14.0 -fobjc-arc \
 		-c "$ROOT/src/ios/simulator_metal.m" -o "$WORK/simulator_metal.o"
-	HOOKS="$(metal_hooks iphonesimulator -mios-simulator-version-min=14.0) $(nearby_object iphonesimulator arm64-apple-ios17.0-simulator)"
+	HOOKS="$(metal_hooks iphonesimulator -mios-simulator-version-min=14.0) $(nearby_object iphonesimulator arm64-apple-ios17.0-simulator) $(tailcat_library iphonesimulator arm64-apple-ios17.0-simulator)"
 	run xcodebuild-sim xcodebuild -project "$SX/sts2.xcodeproj" -scheme sts2 -configuration Release -sdk iphonesimulator \
 		-destination "generic/platform=iOS Simulator" -derivedDataPath "$WORK/sim-derived" ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
 		CODE_SIGN_IDENTITY=- CODE_SIGNING_REQUIRED=NO DEVELOPMENT_TEAM= \
-		OTHER_LDFLAGS="-Wl,-U,_fmod_library_init $WORK/simulator_metal.o $HOOKS -framework Metal $NEARBY_LDFLAGS" build
+		OTHER_LDFLAGS="-Wl,-U,_fmod_library_init $WORK/simulator_metal.o $HOOKS -framework Metal $NEARBY_LDFLAGS $TAILCAT_LDFLAGS" build
 	APP="$WORK/sim-derived/Build/Products/Release-iphonesimulator/sts2.app"
 	[[ -d "$APP" ]] || die "no Simulator app built (see $(show "$LOGS/xcodebuild-sim.log"))"
 	C="$APP/.sts2.pck.clone"
@@ -538,9 +563,9 @@ fi
 
 # ---------------------------------------------------------------------------------------------------- app
 step "Building the app with Xcode"
-HOOKS="$(metal_hooks iphoneos -miphoneos-version-min=17.0) $(nearby_object iphoneos arm64-apple-ios17.0)"
+HOOKS="$(metal_hooks iphoneos -miphoneos-version-min=17.0) $(nearby_object iphoneos arm64-apple-ios17.0) $(tailcat_library iphoneos arm64-apple-ios17.0)"
 XB=(xcodebuild -project "$X/sts2.xcodeproj" -scheme sts2 -configuration Release -destination generic/platform=iOS
-	-derivedDataPath "$WORK/derived" OTHER_LDFLAGS="-Wl,-U,_fmod_library_init $HOOKS -framework Metal $NEARBY_LDFLAGS")
+	-derivedDataPath "$WORK/derived" OTHER_LDFLAGS="-Wl,-U,_fmod_library_init $HOOKS -framework Metal $NEARBY_LDFLAGS $TAILCAT_LDFLAGS")
 if [[ $UNSIGNED -eq 1 ]]; then
 	run xcodebuild "${XB[@]}" CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build
 else

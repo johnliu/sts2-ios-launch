@@ -126,6 +126,10 @@ your saves (or skip that).
     router, shared network or IP address. Pair each pair of phones once (**Pair a phone** under Join, or on the
     host's banner), then the host's game shows up under Join as "*phone*, nearby". Builds signed with a free Apple ID
     leave this out (Apple doesn't offer Wi-Fi Aware to them). Not yet tested between two phones.
+  - **By invite, from anywhere:** the host taps **Copy invite** on its banner and sends it (Messages, etc.); the
+    other player copies it and taps **Paste invite** under Join. The game travels through an encrypted
+    [Tailcat](https://github.com/tailscale/tailcat) tunnel (WireGuard, set up through Tailscale's public relays, phone to
+    phone when the networks allow it): no Tailscale account, app or VPN, and it works with a free Apple ID.
   - **Names:** players see each other's Steam names. Names come from the iOS host, so with a PC host
     they show as "Host" / "Player 123456".
   - **Keeps running when you leave the app:** during a multiplayer game, pulling down Notification Center or

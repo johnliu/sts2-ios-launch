@@ -5,6 +5,7 @@ extends CanvasLayer
 signal join_submitted(ip: String)
 signal cancelled
 signal banner_action
+signal banner_invite
 signal pair_requested
 
 const GOLD := Color(0.95, 0.82, 0.45)
@@ -25,6 +26,8 @@ var _nearby := false
 var _banner: PanelContainer
 var _banner_label: Label
 var _banner_button: Button
+var _banner_invite: Button
+var _paste: Button
 
 
 func _init() -> void:
@@ -77,6 +80,7 @@ func _init() -> void:
 		+ "it at the top of its screen). A PC host must launch Slay the Spire 2 with --fastmp, then choose " \
 		+ "Multiplayer > Host. When you're apart, use Tailscale."
 	col.add_child(_message)
+	_message.set_meta("lan_text", _message.text)
 	var row := HBoxContainer.new()
 	row.add_theme_constant_override("separation", 18)
 	col.add_child(row)
@@ -91,6 +95,11 @@ func _init() -> void:
 		DisplayServer.virtual_keyboard_hide()
 		cancelled.emit()))
 	row.add_child(_button("Join", _submit))
+	_paste = _button("Paste invite", func():
+		DisplayServer.virtual_keyboard_hide()
+		join_submitted.emit(DisplayServer.clipboard_get().strip_edges()))
+	_paste.visible = false
+	row.add_child(_paste)
 	_error = Label.new()
 	_error.add_theme_color_override("font_color", ERROR_COLOR)
 	col.add_child(_error)
@@ -148,6 +157,11 @@ func _init() -> void:
 	if _font != null:
 		_banner_button.theme.default_font = _font
 	banner_content.add_child(_banner_button)
+	_banner_invite = _button("", func(): banner_invite.emit())
+	_banner_invite.custom_minimum_size = _banner_button.custom_minimum_size
+	_banner_invite.add_theme_font_size_override("font_size", 24)
+	_banner_invite.theme = _banner_button.theme
+	banner_content.add_child(_banner_invite)
 	var banner_row := CenterContainer.new()
 	banner_row.set_anchors_preset(Control.PRESET_TOP_WIDE)
 	banner_row.position.y = 14
@@ -234,16 +248,29 @@ func set_nearby(supported: bool, paired: int) -> void:
 		_nearby_label.text = "Paired phones that host show up here, even without Wi-Fi. Pair another phone:"
 
 
+## supported: this build can join by invite over Tailcat (aot/Port/PortTailcat.cs).
+func set_invite(supported: bool) -> void:
+	_paste.visible = supported
+	_ip.custom_minimum_size.x = 400 if supported else 560
+	_message.text = _message.get_meta("lan_text")
+	if supported:
+		_message.text = _message.text.replace("When you're apart, use Tailscale.",
+			"When you're apart, the host taps Copy invite and sends it to you: copy it, then tap Paste invite.")
+
+
 func close_join() -> void:
 	DisplayServer.virtual_keyboard_hide()
 	_dialog.visible = false
 
 
-## action: optional button text (e.g. "Cancel"); pressing it emits banner_action.
-func show_banner(text: String, action: String = "") -> void:
+## action: optional button text (e.g. "Cancel"); pressing it emits banner_action. invite_action: likewise for
+## banner_invite.
+func show_banner(text: String, action: String = "", invite_action: String = "") -> void:
 	_banner_label.text = text
 	_banner_button.text = action
 	_banner_button.visible = action != ""
+	_banner_invite.text = invite_action
+	_banner_invite.visible = invite_action != ""
 	_banner.visible = true
 
 

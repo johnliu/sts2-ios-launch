@@ -48,6 +48,7 @@ static class PortMp
 	static List<PortDiscovery.Host> _lanHosts = new();
 	static List<(ulong Id, string Name)> _nearbyHosts = new();
 	static int _browseGeneration;
+	static long _inviteCopiedAt = long.MinValue / 2;
 	const string NearbyPrefix = "nearby:";
 
 	[ModuleInitializer]
@@ -113,12 +114,14 @@ static class PortMp
 		string nearbyName = "";
 		int browse = ++_browseGeneration;
 		ui.Call("set_nearby", nearby, PortNearby.PairedCount);
+		ui.Call("set_invite", PortTailcat.Supported);
 		if (nearby)
 		{
 			PortNearby.Browse(true);
 			_ = PollNearbyHosts(browse);
 		}
 		nearby = false; // from here on: whether the chosen game is a nearby one
+		bool invite = false; // or one joined by invite, over Tailcat
 		try
 		{
 			while (true)
@@ -140,9 +143,16 @@ static class PortMp
 					if (nearby) break;
 					continue;
 				}
+				if (PortTailcat.Supported && PortTailcat.IsInvite(choice))
+				{
+					(invite, error) = await ConnectInvite(choice);
+					if (invite) break;
+					continue;
+				}
 				ip = choice;
 				if (Ipv4.IsMatch(ip) && IPAddress.TryParse(ip, out _)) break;
-				error = "That isn't an IP address. It looks like 192.168.1.20.";
+				error = PortTailcat.Supported ? "That isn't an IP address (like 192.168.1.20) or an invite."
+					: "That isn't an IP address. It looks like 192.168.1.20.";
 			}
 		}
 		finally
@@ -151,9 +161,9 @@ static class PortMp
 			_browseGeneration++;
 			PortNearby.Browse(false);
 		}
-		if (nearby)
+		if (nearby || invite)
 		{
-			ip = "127.0.0.1"; // the relay to the nearby host (src/ios/nearby_play.swift)
+			ip = "127.0.0.1"; // the relay to the host (src/ios/nearby_play.swift, src/ios/tailcat/tailcat_play.go)
 		}
 		else
 		{
@@ -165,6 +175,7 @@ static class PortMp
 		ulong id = ClientId();
 		PortHooks.NullPlayerId = id;
 		Log(nearby ? $"joining {nearbyName} nearby over Wi-Fi Aware as player {id} ({PortNearby.Status})"
+			: invite ? $"joining by invite over Tailcat as player {id} ({PortTailcat.Status})"
 			: $"joining {ip}:{Port} as player {id} (this device: {wifi ?? "no Wi-Fi"}{(tailscale != null ? ", Tailscale " + tailscale : "")})");
 		await PortNames.StartClient(ip, id);
 		var previous = PortHooks.ClientService;
@@ -176,6 +187,7 @@ static class PortMp
 		var joined = PortHooks.ClientService;
 		if (joined != null && joined != previous && joined != tracked) PortKeepAlive.Track(() => joined.IsConnected);
 		if (nearby) _ = CloseNearbyWhenDone(joined ?? tracked);
+		if (invite) _ = CloseInviteWhenDone(joined ?? tracked);
 	}
 
 	// ---- nearby (Wi-Fi Aware, src/native/Port/PortNearby.cs) ----
@@ -240,6 +252,50 @@ static class PortMp
 		Log($"nearby: stopped hosting ({PortNearby.Status})");
 	}
 
+	// ---- invite (Tailcat, src/native/Port/PortTailcat.cs) ----
+
+	// Opens the Tailcat relay to the host whose invite was pasted. Returns whether it's ready, and an error to show.
+	static async Task<(bool Ok, string Error)> ConnectInvite(string invite)
+	{
+		EnsureUi().Call("show_note", "Connecting to the host…");
+		PortTailcat.Join(invite);
+		for (int i = 0; i < 125; i++) // 25 s
+		{
+			int state = PortTailcat.JoinState;
+			if (state == 2) return (true, "");
+			if (state != 1) break;
+			await Wait(0.2);
+		}
+		string why = PortTailcat.Status;
+		PortTailcat.Leave();
+		Log($"tailcat: couldn't connect ({why})");
+		return (false, "Couldn't connect with that invite. Check the host is still hosting, or ask for a new invite.");
+	}
+
+	static async Task CloseInviteWhenDone(NetClientGameService? service)
+	{
+		while (PortTailcat.JoinState == 2 && service != null && service.IsConnected) await Wait(2);
+		Log($"tailcat: left the host's game ({PortTailcat.Status})");
+		PortTailcat.Leave();
+	}
+
+	// Offers this phone's game by invite until it stops hosting.
+	static async Task OfferInvite(NetHostGameService service, int generation)
+	{
+		PortTailcat.Host(true);
+		while (generation == _hostGeneration && service.IsConnected) await Wait(1);
+		if (generation == _hostGeneration) PortTailcat.Host(false); // a newer host keeps offering
+		Log($"tailcat: stopped hosting ({PortTailcat.Status})");
+	}
+
+	static void CopyInvite()
+	{
+		string invite = PortTailcat.Address;
+		if (invite == "") return;
+		DisplayServer.ClipboardSet(invite);
+		_inviteCopiedAt = System.Environment.TickCount64;
+	}
+
 	// Join dialog list (main thread).
 	static void ShowHosts(List<PortDiscovery.Host> hosts)
 	{
@@ -288,6 +344,7 @@ static class PortMp
 		int generation = ++_hostGeneration;
 		_ = HostBannerLoop(service, generation);
 		if (PortNearby.Supported) _ = OfferNearby(service, generation);
+		if (PortTailcat.Supported) _ = OfferInvite(service, generation);
 	}
 
 	static async Task HostBannerLoop(NetHostGameService service, int generation)
@@ -304,12 +361,17 @@ static class PortMp
 		if (nearby) address += " or nearby";
 		Log($"hosting on {address}, port {Port}");
 		// The lobby (character select) is part of the main menu; hide once the run starts or hosting stops.
-		bool previewed = false;
+		bool previewed = false, inviteLogged = false;
 		while (generation == _hostGeneration && service.IsConnected && NGame.Instance?.MainMenu != null)
 		{
 			int players = service.ConnectedPeers.Count + 1;
 			int cap = PortHooks.LanMaxPlayers(4);
-			EnsureUi().Call("show_banner", $"Hosting · others join at {address} · {players} of {cap} players here", nearby ? "Pair a phone" : "");
+			bool invite = PortTailcat.Address != "";
+			if (invite && !inviteLogged) Log($"tailcat: invite ready ({PortTailcat.Status})");
+			inviteLogged |= invite;
+			string inviteAction = !invite ? "" : System.Environment.TickCount64 - _inviteCopiedAt < 3000 ? "Copied" : "Copy invite";
+			EnsureUi().Call("show_banner", $"Hosting · others join at {address}{(invite ? " or by invite" : "")} · {players} of {cap} players here",
+				nearby ? "Pair a phone" : "", inviteAction);
 			if (!previewed) previewed = PreviewLobby(tree);
 			await tree.ToSignal(tree.CreateTimer(1.0, true, false, true), SceneTreeTimer.SignalName.Timeout);
 		}
@@ -502,7 +564,8 @@ static class PortMp
 		_ui.Connect("join_submitted", Callable.From<string>(ip => _choice?.TrySetResult(("join", ip))));
 		_ui.Connect("cancelled", Callable.From(() => _choice?.TrySetResult(("cancel", ""))));
 		_ui.Connect("pair_requested", Callable.From(PortNearby.Pair));
-		_ui.Connect("banner_action", Callable.From(PortNearby.Pair)); // the host banner's only button
+		_ui.Connect("banner_action", Callable.From(PortNearby.Pair));
+		_ui.Connect("banner_invite", Callable.From(CopyInvite));
 		((SceneTree)Engine.GetMainLoop()).Root.CallDeferred(Node.MethodName.AddChild, _ui);
 		return _ui;
 	}
