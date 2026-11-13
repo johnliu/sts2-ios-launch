@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    The Steam version's mod for multiplayer by invite (see InviteMod.cs). Built by build_pcmod.sh against the game's
+    own DLLs: GameDataDir is the game's data_sts2_* folder.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <OutputType>Library</OutputType>
+    <AssemblyName>TailcatInvites</AssemblyName>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="$(GameDataDir)/sts2.dll" Private="false" />
+    <Reference Include="$(GameDataDir)/GodotSharp.dll" Private="false" />
+    <Reference Include="$(GameDataDir)/0Harmony.dll" Private="false" />
+  </ItemGroup>
+</Project>

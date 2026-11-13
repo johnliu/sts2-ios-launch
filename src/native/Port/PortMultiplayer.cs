@@ -163,7 +163,7 @@ static class PortMp
 		}
 		if (nearby || invite)
 		{
-			ip = "127.0.0.1"; // the relay to the host (src/ios/nearby_play.swift, src/ios/tailcat/tailcat_play.go)
+			ip = "127.0.0.1"; // the relay to the host (src/ios/nearby_play.swift, src/tailcat/ios/tailcat_play.go)
 		}
 		else
 		{

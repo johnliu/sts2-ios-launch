@@ -484,19 +484,19 @@ nearby_object() { # <sdk> <target> -> prints the object's path
 	fi
 	echo "$o"
 }
-# Multiplayer from anywhere over Tailcat (src/ios/tailcat/tailcat_play.go). Go, built as a static library and
+# Multiplayer from anywhere over Tailcat (src/tailcat/ios/tailcat_play.go). Go, built as a static library and
 # force-loaded: nothing in the app refers to it, PortTailcat.cs looks its functions up at run time.
 tailcat_library() { # <sdk> <clang target> -> prints the linker flag
-	local a="$WORK/tailcat_play-$1-$(fingerprint "$ROOT/src/ios/tailcat" "$GO_VERSION" | cut -c1-12).a"
+	local a="$WORK/tailcat_play-$1-$(fingerprint "$ROOT/src/tailcat" "$GO_VERSION" | cut -c1-12).a"
 	if [[ ! -f "$a" ]]; then
 		rm -f "$WORK"/tailcat_play-"$1"-*.a
 		local go="$TOOLS/go/bin/go" tags
 		export GOROOT="$TOOLS/go" GOPATH="$TOOLS/go-path" GOCACHE="$TOOLS/go-cache" GOTOOLCHAIN=local GOFLAGS=-mod=readonly
-		cd "$ROOT/src/ios/tailcat"
+		cd "$ROOT/src/tailcat"
 		run tailcat-mod "$go" mod download github.com/tailscale/tailcat >&2
 		tags="$(cat "$("$go" list -m -f '{{.Dir}}' github.com/tailscale/tailcat)/build-tags.txt")"
 		CGO_ENABLED=1 GOOS=ios GOARCH=arm64 CC="$(xcrun -sdk "$1" -f clang) -isysroot $(xcrun -sdk "$1" --show-sdk-path) -target $2" \
-			run "tailcat-$1" "$go" build -trimpath -buildvcs=false -tags "$tags" -ldflags='-s -w' -buildmode=c-archive -o "$a" . >&2
+			run "tailcat-$1" "$go" build -trimpath -buildvcs=false -tags "$tags" -ldflags='-s -w' -buildmode=c-archive -o "$a" ./ios >&2
 		rm -f "${a%.a}.h"
 	fi
 	echo "-Wl,-force_load,$a"

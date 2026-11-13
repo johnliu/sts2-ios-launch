@@ -4,7 +4,7 @@ using System.Runtime.InteropServices;
 
 namespace PortMultiplayer;
 
-// Multiplayer from anywhere over Tailcat (src/ios/tailcat/tailcat_play.go, linked into the app executable): the
+// Multiplayer from anywhere over Tailcat (src/tailcat/ios/tailcat_play.go, linked into the app executable): the
 // hosting phone shares an invite, and a joining phone relays the game's UDP ports to it through a WireGuard tunnel,
 // so the game joins 127.0.0.1. No Tailscale account, app or VPN. Call only on the main thread.
 static unsafe class PortTailcat

@@ -130,6 +130,7 @@ your saves (or skip that).
     other player copies it and taps **Paste invite** under Join. The game travels through an encrypted
     [Tailcat](https://github.com/tailscale/tailcat) tunnel (WireGuard, set up through Tailscale's public relays, phone to
     phone when the networks allow it): no Tailscale account, app or VPN, and it works with a free Apple ID.
+    Steam players join in with the [Tailcat Invites mod](#playing-with-the-steam-version).
   - **Names:** players see each other's Steam names. Names come from the iOS host, so with a PC host
     they show as "Host" / "Player 123456".
   - **Keeps running when you leave the app:** during a multiplayer game, pulling down Notification Center or
@@ -148,6 +149,23 @@ your saves (or skip that).
   - **Perfected Deck:** after every other modifier, your whole deck turns into Perfected Strike+.
 
 Tested on an iPhone 16 Pro Max running iOS 27.
+
+## Playing with the Steam version
+
+The **Tailcat Invites** mod ([`src/pcmod`](src/pcmod)) lets Windows, Mac and Linux players host and join invite games
+with iPhones and iPads (and with each other), without changing their launch options:
+
+1. Build it with `tools/build_pcmod.sh` (on a Mac with the game installed through Steam; `--install` also puts it in
+   that install's mods folder), then give players `build/pcmod/TailcatInvites.zip`.
+2. Players unzip it into the game's `mods` folder, next to the game's executable (on Windows,
+   `…\steamapps\common\Slay the Spire 2\mods`; on a Mac, right-click the game in Finder, Show Package Contents, then
+   `Contents/MacOS/mods`), start the game and accept its mods warning.
+3. Under **Multiplayer**, turn on **Invite play**. **Host** then shows **Copy invite** at the top of the screen;
+   **Join** joins the invite on the clipboard.
+
+With Invite play on, the game hosts and joins only by invite (as with `--fastmp`), not through Steam; turn it off
+for Steam friends. Games with a Steam player stay at 4 players. The mod doesn't affect gameplay, so it doesn't stop
+anyone joining. Everyone still needs the same game version. Not yet tested in a real game.
 
 ## Playing the beta
 
