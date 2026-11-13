@@ -288,12 +288,14 @@ static class PortMp
 		PortTailcat.Join(invite);
 		for (int i = 0; i < 125; i++) // 25 s
 		{
+			PortTailcat.FlushLog(Log);
 			int state = PortTailcat.JoinState;
 			if (state == 2) return (true, "");
 			if (state != 1) break;
 			await Wait(0.2);
 		}
 		string why = PortTailcat.Status;
+		PortTailcat.FlushLog(Log);
 		PortTailcat.Leave();
 		Log($"tailcat: couldn't connect ({why})");
 		return (false, "Couldn't connect with that invite. Check the host is still hosting, or ask for a new invite.");
@@ -309,8 +311,20 @@ static class PortMp
 	// Offers this phone's game by invite until it stops hosting.
 	static async Task OfferInvite(NetHostGameService service, int generation)
 	{
+		var tree = (SceneTree)Engine.GetMainLoop();
+		await tree.ToSignal(tree, SceneTree.SignalName.ProcessFrame); // StartENetHost is still running
+		if (generation != _hostGeneration || !service.IsConnected) return;
 		PortTailcat.Host(true);
-		while (generation == _hostGeneration && service.IsConnected) await Wait(1);
+		string last = "";
+		bool ready = false;
+		while (generation == _hostGeneration && service.IsConnected)
+		{
+			string status = PortTailcat.Status;
+			if (status != last) Log($"tailcat: {last = status}");
+			if (!ready) PortTailcat.FlushLog(Log); // until there's a code; then it's routine connection chatter
+			ready = PortTailcat.Address != "";
+			await Wait(1);
+		}
 		if (generation == _hostGeneration) PortTailcat.Host(false); // a newer host keeps offering
 		Log($"tailcat: stopped hosting ({PortTailcat.Status})");
 	}

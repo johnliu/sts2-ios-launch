@@ -36,7 +36,8 @@ var (
 	loopback  = net.IPv4(127, 0, 0, 1)
 )
 
-func quiet(string, ...any) {}
+// Logf receives Tailcat's own diagnostics; set it before starting a host or join.
+var Logf = func(string, ...any) {}
 
 // ---- host ----
 
@@ -49,7 +50,7 @@ type Host struct {
 func StartHost() (*Host, string, error) {
 	slots := make(chan struct{}, maxJoiners)
 	s := &tailcat.Server{
-		Logf:           quiet,
+		Logf:           Logf,
 		ServedTCPPorts: []filter.PortRange{{First: tunnelPort, Last: tunnelPort}},
 		OnTCP: func(port uint16) func(net.Conn) {
 			if port != tunnelPort {
@@ -129,7 +130,7 @@ func Listen(invite string) (*Join, error) {
 	if _, err := tailcat.ParseAddr(addr); err != nil {
 		return nil, errors.New("not an invite: " + err.Error())
 	}
-	j := &Join{client: &tailcat.Client{Server: addr, Logf: quiet}, game: make([]*net.UDPAddr, len(gamePorts))}
+	j := &Join{client: &tailcat.Client{Server: addr, Logf: Logf}, game: make([]*net.UDPAddr, len(gamePorts))}
 	for _, port := range gamePorts {
 		u, err := net.ListenUDP("udp", &net.UDPAddr{IP: loopback, Port: port})
 		if err != nil {

@@ -3,5 +3,5 @@
 
 __attribute__((used)) static void *const keep[] = {
 	port_tailcat_status, port_tailcat_host, port_tailcat_address,
-	port_tailcat_join, port_tailcat_join_state, port_tailcat_leave,
+	port_tailcat_join, port_tailcat_join_state, port_tailcat_leave, port_tailcat_log,
 };

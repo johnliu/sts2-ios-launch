@@ -11,7 +11,7 @@ static unsafe class PortTailcat
 {
 	static bool _loaded;
 	static delegate* unmanaged<int> _joinState;
-	static delegate* unmanaged<IntPtr> _status, _address;
+	static delegate* unmanaged<IntPtr> _status, _address, _log;
 	static delegate* unmanaged<int, void> _host;
 	static delegate* unmanaged<IntPtr, void> _join;
 	static delegate* unmanaged<void> _leave;
@@ -25,6 +25,7 @@ static unsafe class PortTailcat
 		_joinState = (delegate* unmanaged<int>)F("port_tailcat_join_state");
 		_status = (delegate* unmanaged<IntPtr>)F("port_tailcat_status");
 		_address = (delegate* unmanaged<IntPtr>)F("port_tailcat_address");
+		_log = (delegate* unmanaged<IntPtr>)F("port_tailcat_log");
 		_host = (delegate* unmanaged<int, void>)F("port_tailcat_host");
 		_join = (delegate* unmanaged<IntPtr, void>)F("port_tailcat_join");
 		_leave = (delegate* unmanaged<void>)F("port_tailcat_leave");
@@ -58,4 +59,12 @@ static unsafe class PortTailcat
 	public static int JoinState => Supported ? _joinState() : 0;
 
 	public static void Leave() { if (Supported) _leave(); }
+
+	/// Passes Tailcat's diagnostics since the last call to log, one line at a time.
+	public static void FlushLog(Action<string> log)
+	{
+		if (!Supported || _log == null) return;
+		string lines = Marshal.PtrToStringUTF8(_log()) ?? "";
+		if (lines.Length > 0) foreach (var line in lines.Split('\n')) log("tailcat: " + line);
+	}
 }

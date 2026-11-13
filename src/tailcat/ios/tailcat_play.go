@@ -10,6 +10,8 @@ import "C"
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"sync"
 	"time"
 	"unsafe"
@@ -30,6 +32,35 @@ var (
 )
 
 func main() {}
+
+// Tailcat's diagnostics, for the game's log (port_tailcat_log).
+var (
+	logMu    sync.Mutex
+	logLines []string
+)
+
+func init() {
+	relay.Logf = func(format string, args ...any) {
+		logMu.Lock()
+		defer logMu.Unlock()
+		if len(logLines) < 500 {
+			logLines = append(logLines, strings.TrimRight(fmt.Sprintf(format, args...), "\n"))
+		}
+	}
+}
+
+// Returns (and forgets) the diagnostics since the last call, one per line.
+//
+//export port_tailcat_log
+func port_tailcat_log() *C.char {
+	logMu.Lock()
+	lines := strings.Join(logLines, "\n")
+	logLines = nil
+	logMu.Unlock()
+	mu.Lock()
+	defer mu.Unlock()
+	return cString(lines)
+}
 
 // cString returns a C string that stays valid until the next call (main thread only).
 func cString(s string) *C.char {
