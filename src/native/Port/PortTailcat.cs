@@ -39,9 +39,6 @@ static unsafe class PortTailcat
 		}
 	}
 
-	/// Whether text looks like an invite (a Tailcat address) rather than an IP address.
-	public static bool IsInvite(string text) => text.StartsWith("tc", StringComparison.Ordinal) && text.Length > 20;
-
 	public static string Status => Supported ? Marshal.PtrToStringUTF8(_status()) ?? "" : "not in this build";
 
 	public static void Host(bool on) { if (Supported) _host(on ? 1 : 0); }

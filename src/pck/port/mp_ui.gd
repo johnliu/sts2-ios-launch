@@ -7,6 +7,8 @@ signal cancelled
 signal banner_action
 signal banner_invite
 signal pair_requested
+signal choice_made(index: int)
+signal code_submitted(code: String)
 
 const GOLD := Color(0.95, 0.82, 0.45)
 const ERROR_COLOR := Color(1.0, 0.6, 0.5)
@@ -27,7 +29,13 @@ var _banner: PanelContainer
 var _banner_label: Label
 var _banner_button: Button
 var _banner_invite: Button
-var _paste: Button
+var _choice: Control
+var _choice_title: Label
+var _choice_text: Label
+var _choice_buttons: HBoxContainer
+var _code: Control
+var _code_field: LineEdit
+var _code_error: Label
 
 
 func _init() -> void:
@@ -80,7 +88,6 @@ func _init() -> void:
 		+ "it at the top of its screen). A PC host must launch Slay the Spire 2 with --fastmp, then choose " \
 		+ "Multiplayer > Host. When you're apart, use Tailscale."
 	col.add_child(_message)
-	_message.set_meta("lan_text", _message.text)
 	var row := HBoxContainer.new()
 	row.add_theme_constant_override("separation", 18)
 	col.add_child(row)
@@ -95,11 +102,6 @@ func _init() -> void:
 		DisplayServer.virtual_keyboard_hide()
 		cancelled.emit()))
 	row.add_child(_button("Join", _submit))
-	_paste = _button("Paste invite", func():
-		DisplayServer.virtual_keyboard_hide()
-		join_submitted.emit(DisplayServer.clipboard_get().strip_edges()))
-	_paste.visible = false
-	row.add_child(_paste)
 	_error = Label.new()
 	_error.add_theme_color_override("font_color", ERROR_COLOR)
 	col.add_child(_error)
@@ -136,6 +138,44 @@ func _init() -> void:
 	set_hosts([])
 	_dialog.visible = false
 
+	# How to host or join (show_choice): nearby and on the Wi-Fi, or with an invite code.
+	_choice = _panel(theme)
+	var choice_col: VBoxContainer = _choice.get_meta("col")
+	_choice_title = choice_col.get_child(0) as Label
+	_choice_text = choice_col.get_child(1) as Label
+	_choice_buttons = HBoxContainer.new()
+	_choice_buttons.add_theme_constant_override("separation", 18)
+	choice_col.add_child(_choice_buttons)
+	add_child(_choice)
+	_choice.visible = false
+
+	# Invite code entry (show_code).
+	_code = _panel(theme)
+	var code_col: VBoxContainer = _code.get_meta("col")
+	(code_col.get_child(0) as Label).text = "Join with an invite code"
+	(code_col.get_child(1) as Label).text = "Ask the host to tap Copy invite code and send it to you (Messages works), then " \
+		+ "copy it and tap Paste."
+	_code_field = LineEdit.new()
+	_code_field.placeholder_text = "Invite code (starts with tc)"
+	_code_field.custom_minimum_size = Vector2(1120, 76)
+	_code_field.text_submitted.connect(func(_t): _submit_code())
+	code_col.add_child(_code_field)
+	_code_error = Label.new()
+	_code_error.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_code_error.custom_minimum_size = Vector2(1120, 0)
+	code_col.add_child(_code_error)
+	var code_row := HBoxContainer.new()
+	code_row.add_theme_constant_override("separation", 18)
+	code_row.alignment = BoxContainer.ALIGNMENT_END
+	code_row.add_child(_button("Cancel", func():
+		DisplayServer.virtual_keyboard_hide()
+		cancelled.emit()))
+	code_row.add_child(_button("Paste", func(): _code_field.text = DisplayServer.clipboard_get().strip_edges()))
+	code_row.add_child(_button("Join", _submit_code))
+	code_col.add_child(code_row)
+	add_child(_code)
+	_code.visible = false
+
 	# Hosting banner.
 	_banner = PanelContainer.new()
 	_banner.add_theme_stylebox_override("panel", _box(Color(0.05, 0.06, 0.08, 0.88), Color(GOLD, 0.6), 2, 14, 12))
@@ -169,6 +209,87 @@ func _init() -> void:
 	banner_row.add_child(_banner)
 	add_child(banner_row)
 	_banner.visible = false
+
+
+## A dialog like the join one: dimmed screen, top-anchored panel with a title and a message (meta "col": its column).
+func _panel(theme: Theme) -> Control:
+	var root := Control.new()
+	root.theme = theme
+	root.set_anchors_preset(Control.PRESET_FULL_RECT)
+	var dim := ColorRect.new()
+	dim.color = Color(0, 0, 0, 0.78)
+	dim.set_anchors_preset(Control.PRESET_FULL_RECT)
+	root.add_child(dim)
+	var top := MarginContainer.new()
+	top.set_anchors_preset(Control.PRESET_TOP_WIDE)
+	top.add_theme_constant_override("margin_top", 28)
+	top.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	root.add_child(top)
+	var center := CenterContainer.new()
+	center.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	top.add_child(center)
+	var panel := PanelContainer.new()
+	panel.add_theme_stylebox_override("panel", _box(Color(0.08, 0.09, 0.12, 0.97), GOLD, 3, 18, 30))
+	panel.custom_minimum_size = Vector2(1180, 0)
+	center.add_child(panel)
+	var col := VBoxContainer.new()
+	col.add_theme_constant_override("separation", 16)
+	panel.add_child(col)
+	var title := Label.new()
+	title.add_theme_font_size_override("font_size", 40)
+	title.add_theme_color_override("font_color", GOLD)
+	if _font_bold != null:
+		title.add_theme_font_override("font", _font_bold)
+	col.add_child(title)
+	var text := Label.new()
+	text.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	text.custom_minimum_size = Vector2(1120, 0)
+	col.add_child(text)
+	root.set_meta("col", col)
+	return root
+
+
+func _submit_code() -> void:
+	var code := _code_field.text.strip_edges()
+	if not code.begins_with("tc") or code.length() < 20:
+		_code_error.add_theme_color_override("font_color", ERROR_COLOR)
+		_code_error.text = "That isn't an invite code. Copy the whole code the host sent (it starts with tc)."
+		return
+	DisplayServer.virtual_keyboard_hide()
+	code_submitted.emit(code)
+
+
+## Two or more ways to go on, plus Cancel: emits choice_made with the option's index, or -1.
+func show_choice(title: String, text: String, options: Array) -> void:
+	_choice_title.text = title
+	_choice_text.text = text
+	for child in _choice_buttons.get_children():
+		child.queue_free()
+	for i in options.size():
+		var index := i
+		var b := _button(options[i], func():
+			_choice.visible = false
+			choice_made.emit(index))
+		b.custom_minimum_size = Vector2(380, 76)
+		_choice_buttons.add_child(b)
+	_choice_buttons.add_child(_button("Cancel", func():
+		_choice.visible = false
+		choice_made.emit(-1)))
+	_dialog.visible = false
+	_code.visible = false
+	_choice.visible = true
+
+
+## The invite code dialog; error: why the last code didn't work (or "").
+func show_code(error: String) -> void:
+	var clip := DisplayServer.clipboard_get().strip_edges()
+	if _code_field.text == "" and clip.begins_with("tc"):
+		_code_field.text = clip
+	_code_error.add_theme_color_override("font_color", ERROR_COLOR)
+	_code_error.text = error
+	_dialog.visible = false
+	_choice.visible = false
+	_code.visible = true
 
 
 func _box(bg: Color, border: Color, border_width: int, radius: int, margin: int) -> StyleBoxFlat:
@@ -232,6 +353,10 @@ func set_hosts(hosts: Array) -> void:
 
 ## A progress line where errors go (e.g. "Connecting to …"), in a neutral color.
 func show_note(text: String) -> void:
+	if _code.visible:
+		_code_error.add_theme_color_override("font_color", Color(1, 1, 1, 0.8))
+		_code_error.text = text
+		return
 	_error.add_theme_color_override("font_color", Color(1, 1, 1, 0.8))
 	_error.text = text
 	_error.visible = text != ""
@@ -248,19 +373,11 @@ func set_nearby(supported: bool, paired: int) -> void:
 		_nearby_label.text = "Paired phones that host show up here, even without Wi-Fi. Pair another phone:"
 
 
-## supported: this build can join by invite over Tailcat (aot/Port/PortTailcat.cs).
-func set_invite(supported: bool) -> void:
-	_paste.visible = supported
-	_ip.custom_minimum_size.x = 400 if supported else 560
-	_message.text = _message.get_meta("lan_text")
-	if supported:
-		_message.text = _message.text.replace("When you're apart, use Tailscale.",
-			"When you're apart, the host taps Copy invite and sends it to you: copy it, then tap Paste invite.")
-
-
 func close_join() -> void:
 	DisplayServer.virtual_keyboard_hide()
 	_dialog.visible = false
+	_choice.visible = false
+	_code.visible = false
 
 
 ## action: optional button text (e.g. "Cancel"); pressing it emits banner_action. invite_action: likewise for

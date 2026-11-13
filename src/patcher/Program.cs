@@ -262,6 +262,26 @@ else if (asm.Name.Name == "sts2")
 		Instruction.Create(OpCodes.Ldsfld, onHost), Instruction.Create(OpCodes.Ldarg_0),
 		Instruction.Create(OpCodes.Callvirt, Invoke(actionHost, false)));
 
+	// Host and Load first ask how others join (nearby and on the Wi-Fi, or with an invite code): "if (hook(this,
+	// button)) return;". Public, so the port can run them once the player has chosen.
+	{
+		var submenu = module.GetType("MegaCrit.Sts2.Core.Nodes.Screens.MainMenu.NMultiplayerSubmenu")
+			?? throw new Exception("NMultiplayerSubmenu not found");
+		foreach (var (name, field) in new[] { ("OnHostPressed", "MpHostPressed"), ("StartLoad", "MpLoadPressed") })
+		{
+			var m = Method(submenu.FullName, name);
+			var func = Generic("Func", submenu, m.Parameters[0].ParameterType, module.TypeSystem.Boolean);
+			var hook = Field(field, func);
+			var first = m.Body.Instructions[0];
+			Guard(m, hook,
+				Instruction.Create(OpCodes.Ldsfld, hook), Instruction.Create(OpCodes.Ldarg_0), Instruction.Create(OpCodes.Ldarg_1),
+				Instruction.Create(OpCodes.Callvirt, Invoke(func, true)), Instruction.Create(OpCodes.Brfalse, first),
+				Instruction.Create(OpCodes.Ret));
+			m.IsPrivate = false;
+			m.IsPublic = true;
+		}
+	}
+
 	// Remember the client service each join creates, so the port can keep the app running while it's connected
 	// (src/native/Port/PortKeepAlive.cs). The game's connection interface changed shape in v0.113.0, so wrapping it
 	// would need a different port build per game version.

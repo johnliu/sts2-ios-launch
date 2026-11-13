@@ -15,6 +15,7 @@ using MegaCrit.Sts2.Core.Multiplayer;
 using MegaCrit.Sts2.Core.Multiplayer.Connection;
 using MegaCrit.Sts2.Core.Multiplayer.Serialization;
 using MegaCrit.Sts2.Core.Nodes;
+using MegaCrit.Sts2.Core.Nodes.GodotExtensions;
 using MegaCrit.Sts2.Core.Nodes.Multiplayer;
 using MegaCrit.Sts2.Core.Nodes.Rooms;
 using MegaCrit.Sts2.Core.Nodes.Screens.CharacterSelect;
@@ -49,12 +50,15 @@ static class PortMp
 	static List<(ulong Id, string Name)> _nearbyHosts = new();
 	static int _browseGeneration;
 	static long _inviteCopiedAt = long.MinValue / 2;
+	static bool _hostChosen, _hostByInvite;
 	const string NearbyPrefix = "nearby:";
 
 	[ModuleInitializer]
 	internal static void Init()
 	{
 		PortHooks.MpJoin = JoinAsync;
+		PortHooks.MpHostPressed = (menu, button) => AskHowToHost(menu, button, false);
+		PortHooks.MpLoadPressed = (menu, button) => AskHowToHost(menu, button, true);
 		PortHooks.OnENetHost = OnHost;
 		PortHooks.NullPlayerName = PlayerName;
 		PortHooks.RestSiteSeats = AddRestSiteSeats;
@@ -103,63 +107,78 @@ static class PortMp
 		string ip = cfg.GetValue("mp", "last_ip", "").AsString();
 		var recent = cfg.GetValue("mp", "recent_ips", new string[0]).AsStringArray();
 		var (wifi, tailscale) = Addresses();
-		PokeLocalNetwork(wifi); // brings up iOS's Local Network prompt while the IP is being typed
 		string error = "";
 		var ui = EnsureUi();
-		_lanHosts = new();
-		_nearbyHosts = new();
-		ui.Call("set_hosts", new Godot.Collections.Array());
-		PortDiscovery.Start(recent.Append(ip), hosts => Callable.From(() => ShowHosts(hosts)).CallDeferred());
-		bool nearby = PortNearby.Supported;
+		bool nearby = false; // whether the chosen game is a nearby one
 		string nearbyName = "";
-		int browse = ++_browseGeneration;
-		ui.Call("set_nearby", nearby, PortNearby.PairedCount);
-		ui.Call("set_invite", PortTailcat.Supported);
-		if (nearby)
+		bool invite = false; // or one joined with an invite code, over Tailcat
+		if (PortTailcat.Supported)
 		{
-			PortNearby.Browse(true);
-			_ = PollNearbyHosts(browse);
-		}
-		nearby = false; // from here on: whether the chosen game is a nearby one
-		bool invite = false; // or one joined by invite, over Tailcat
-		try
-		{
-			while (true)
+			ui.Call("show_choice", "Join a multiplayer game",
+				"Pick a game nearby or on your Wi-Fi, or enter the invite code the host sent you. With a code, you can be anywhere.",
+				new Godot.Collections.Array { "Nearby or on Wi-Fi", "With an invite code" });
+			var (kind, arg) = await NextChoice();
+			if (kind != "choice" || arg == "-1")
 			{
-				ui.Call("show_join", ip, error);
-				var (kind, arg) = await NextChoice();
-				if (kind != "join")
+				LeaveJoinScreen(screen);
+				return;
+			}
+			while (arg == "1" && !invite)
+			{
+				ui.Call("show_code", error);
+				var (k, code) = await NextChoice();
+				if (k != "code")
 				{
-					CloseUi();
-					// Leave the (empty) join screen as if its back button was pressed.
-					var back = screen.GetNodeOrNull<Control>("BackButton");
-					back?.EmitSignal("Released", back);
+					LeaveJoinScreen(screen);
 					return;
 				}
-				string choice = arg.Trim();
-				if (choice.StartsWith(NearbyPrefix, StringComparison.Ordinal))
-				{
-					(nearby, nearbyName, error) = await ConnectNearby(choice);
-					if (nearby) break;
-					continue;
-				}
-				if (PortTailcat.Supported && PortTailcat.IsInvite(choice))
-				{
-					(invite, error) = await ConnectInvite(choice);
-					if (invite) break;
-					continue;
-				}
-				ip = choice;
-				if (Ipv4.IsMatch(ip) && IPAddress.TryParse(ip, out _)) break;
-				error = PortTailcat.Supported ? "That isn't an IP address (like 192.168.1.20) or an invite."
-					: "That isn't an IP address. It looks like 192.168.1.20.";
+				(invite, error) = await ConnectInvite(code.Trim());
 			}
 		}
-		finally
+		if (!invite)
 		{
-			PortDiscovery.Stop();
-			_browseGeneration++;
-			PortNearby.Browse(false);
+			PokeLocalNetwork(wifi); // brings up iOS's Local Network prompt while the IP is being typed
+			_lanHosts = new();
+			_nearbyHosts = new();
+			ui.Call("set_hosts", new Godot.Collections.Array());
+			PortDiscovery.Start(recent.Append(ip), hosts => Callable.From(() => ShowHosts(hosts)).CallDeferred());
+			bool browsing = PortNearby.Supported;
+			int browse = ++_browseGeneration;
+			ui.Call("set_nearby", browsing, PortNearby.PairedCount);
+			if (browsing)
+			{
+				PortNearby.Browse(true);
+				_ = PollNearbyHosts(browse);
+			}
+			try
+			{
+				while (true)
+				{
+					ui.Call("show_join", ip, error);
+					var (kind, arg) = await NextChoice();
+					if (kind != "join")
+					{
+						LeaveJoinScreen(screen);
+						return;
+					}
+					string choice = arg.Trim();
+					if (choice.StartsWith(NearbyPrefix, StringComparison.Ordinal))
+					{
+						(nearby, nearbyName, error) = await ConnectNearby(choice);
+						if (nearby) break;
+						continue;
+					}
+					ip = choice;
+					if (Ipv4.IsMatch(ip) && IPAddress.TryParse(ip, out _)) break;
+					error = "That isn't an IP address. It looks like 192.168.1.20.";
+				}
+			}
+			finally
+			{
+				PortDiscovery.Stop();
+				_browseGeneration++;
+				PortNearby.Browse(false);
+			}
 		}
 		if (nearby || invite)
 		{
@@ -188,6 +207,14 @@ static class PortMp
 		if (joined != null && joined != previous && joined != tracked) PortKeepAlive.Track(() => joined.IsConnected);
 		if (nearby) _ = CloseNearbyWhenDone(joined ?? tracked);
 		if (invite) _ = CloseInviteWhenDone(joined ?? tracked);
+	}
+
+	// Leaves the (empty) join screen as if its back button was pressed.
+	static void LeaveJoinScreen(NJoinFriendScreen screen)
+	{
+		CloseUi();
+		var back = screen.GetNodeOrNull<Control>("BackButton");
+		back?.EmitSignal("Released", back);
 	}
 
 	// ---- nearby (Wi-Fi Aware, src/native/Port/PortNearby.cs) ----
@@ -344,7 +371,36 @@ static class PortMp
 		int generation = ++_hostGeneration;
 		_ = HostBannerLoop(service, generation);
 		if (PortNearby.Supported) _ = OfferNearby(service, generation);
-		if (PortTailcat.Supported) _ = OfferInvite(service, generation);
+		if (_hostByInvite && PortTailcat.Supported) _ = OfferInvite(service, generation);
+	}
+
+	// Host and Load (patched: src/patcher) first ask how others join. Returns whether the game's own handler waits.
+	static bool AskHowToHost(NMultiplayerSubmenu menu, NButton button, bool load)
+	{
+		if (_hostChosen) return false;
+		_hostByInvite = false;
+		if (!PortTailcat.Supported) return false;
+		_ = ChooseHost(menu, button, load);
+		return true;
+	}
+
+	static async Task ChooseHost(NMultiplayerSubmenu menu, NButton button, bool load)
+	{
+		var ui = EnsureUi();
+		ui.Call("show_choice", load ? "Continue the multiplayer run" : "Host a multiplayer game",
+			"Others join nearby or on your Wi-Fi, or from anywhere with an invite code you send them.",
+			new Godot.Collections.Array { "Nearby or on Wi-Fi", "With an invite code" });
+		var (kind, arg) = await NextChoice();
+		CloseUi();
+		if (kind != "choice" || arg == "-1") return;
+		_hostByInvite = arg == "1";
+		_hostChosen = true;
+		try
+		{
+			if (load) menu.StartLoad(button);
+			else menu.OnHostPressed(button);
+		}
+		finally { _hostChosen = false; }
 	}
 
 	static async Task HostBannerLoop(NetHostGameService service, int generation)
@@ -361,17 +417,23 @@ static class PortMp
 		if (nearby) address += " or nearby";
 		Log($"hosting on {address}, port {Port}");
 		// The lobby (character select) is part of the main menu; hide once the run starts or hosting stops.
+		bool byInvite = _hostByInvite && PortTailcat.Supported;
 		bool previewed = false, inviteLogged = false;
 		while (generation == _hostGeneration && service.IsConnected && NGame.Instance?.MainMenu != null)
 		{
 			int players = service.ConnectedPeers.Count + 1;
 			int cap = PortHooks.LanMaxPlayers(4);
-			bool invite = PortTailcat.Address != "";
-			if (invite && !inviteLogged) Log($"tailcat: invite ready ({PortTailcat.Status})");
-			inviteLogged |= invite;
-			string inviteAction = !invite ? "" : System.Environment.TickCount64 - _inviteCopiedAt < 3000 ? "Copied" : "Copy invite";
-			EnsureUi().Call("show_banner", $"Hosting · others join at {address}{(invite ? " or by invite" : "")} · {players} of {cap} players here",
-				nearby ? "Pair a phone" : "", inviteAction);
+			string here = $"{players} of {cap} players here";
+			if (byInvite)
+			{
+				bool ready = PortTailcat.Address != "";
+				if (ready && !inviteLogged) Log($"tailcat: invite ready ({PortTailcat.Status})");
+				inviteLogged |= ready;
+				EnsureUi().Call("show_banner",
+					ready ? $"Hosting with an invite code · send it to the others · {here}" : $"Hosting with an invite code · getting a code… · {here}",
+					"", !ready ? "" : System.Environment.TickCount64 - _inviteCopiedAt < 3000 ? "Copied" : "Copy invite code");
+			}
+			else EnsureUi().Call("show_banner", $"Hosting · others join at {address} · {here}", nearby ? "Pair a phone" : "");
 			if (!previewed) previewed = PreviewLobby(tree);
 			await tree.ToSignal(tree.CreateTimer(1.0, true, false, true), SceneTreeTimer.SignalName.Timeout);
 		}
@@ -562,7 +624,9 @@ static class PortMp
 		var script = GD.Load<GDScript>("res://port/mp_ui.gd");
 		_ui = (Node)script.New().AsGodotObject();
 		_ui.Connect("join_submitted", Callable.From<string>(ip => _choice?.TrySetResult(("join", ip))));
-		_ui.Connect("cancelled", Callable.From(() => _choice?.TrySetResult(("cancel", ""))));
+		_ui.Connect("cancelled", Callable.From(() => { _choice?.TrySetResult(("cancel", "")); }));
+		_ui.Connect("choice_made", Callable.From<int>(i => { _choice?.TrySetResult(("choice", i.ToString())); }));
+		_ui.Connect("code_submitted", Callable.From<string>(code => { _choice?.TrySetResult(("code", code)); }));
 		_ui.Connect("pair_requested", Callable.From(PortNearby.Pair));
 		_ui.Connect("banner_action", Callable.From(PortNearby.Pair));
 		_ui.Connect("banner_invite", Callable.From(CopyInvite));
