@@ -2,7 +2,7 @@
   "id": "TailcatInvites",
   "name": "Tailcat Invites",
   "author": "sts2-ios-launch",
-  "description": "Multiplayer by invite: play with friends anywhere, including on iPhone and iPad, without Steam lobbies. Turn on Invite play under Multiplayer; the host copies an invite, the others copy it and choose Join.",
+  "description": "Multiplayer by invite: play with friends anywhere, including on iPhone and iPad, without Steam lobbies. Host and Join under Multiplayer ask whether to use Steam or an invite code.",
   "version": "0.1.0",
   "has_pck": false,
   "has_dll": true,

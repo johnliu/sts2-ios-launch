@@ -153,18 +153,19 @@ Tested on an iPhone 16 Pro Max running iOS 27.
 ## Playing with the Steam version
 
 The **Tailcat Invites** mod ([`src/pcmod`](src/pcmod)) lets Windows, Mac and Linux players host and join invite games
-with iPhones and iPads (and with each other), without changing their launch options:
+with iPhones and iPads (and with each other), next to the usual Steam multiplayer:
 
 1. Build it with `tools/build_pcmod.sh` (on a Mac with the game installed through Steam; `--install` also puts it in
    that install's mods folder), then give players `build/pcmod/TailcatInvites.zip`.
 2. Players unzip it into the game's `mods` folder, next to the game's executable (on Windows,
    `…\steamapps\common\Slay the Spire 2\mods`; on a Mac, right-click the game in Finder, Show Package Contents, then
    `Contents/MacOS/mods`), start the game and accept its mods warning.
-3. Under **Multiplayer**, turn on **Invite play**. **Host** then shows **Copy invite** at the top of the screen;
-   **Join** joins the invite on the clipboard.
+3. Under **Multiplayer**, **Host** (and **Load**) asks whether to host via Steam or with an invite code; with a code,
+   **Copy invite code** appears at the top of the screen. **Join** asks whether to join a Steam friend or enter an
+   invite code.
 
-With Invite play on, the game hosts and joins only by invite (as with `--fastmp`), not through Steam; turn it off
-for Steam friends. Games with a Steam player stay at 4 players. The mod doesn't affect gameplay, so it doesn't stop
+Don't add `--fastmp` to the launch options: the mod switches it on for invite games only. Games with a Steam
+player stay at 4 players. The mod doesn't affect gameplay, so it doesn't stop
 anyone joining. Everyone still needs the same game version. Not yet tested in a real game.
 
 ## Playing the beta

@@ -16,19 +16,20 @@ using MegaCrit.Sts2.Core.Nodes.Screens.MainMenu;
 namespace TailcatInvites;
 
 // Multiplayer by invite for the Steam version, compatible with the iOS port (github.com/FlyingViet/sts2-ios-launch).
-// Turning on "Invite play" under Multiplayer makes the game act as if launched with --fastmp, which it already
-// supports: hosting uses its direct (ENet, UDP 33771) host instead of a Steam lobby, and Join connects to 127.0.0.1.
-// A helper (src/tailcat/cmd/sts2-tailcat) carries those ports through a Tailcat tunnel: when hosting it prints the
-// invite to share; when joining it relays 127.0.0.1 to the invite on the clipboard. The game loads this assembly and
-// applies the patches below (no ModInitializer, so it calls Harmony's PatchAll).
+// Multiplayer's Host, Load and Join ask whether to go through Steam or an invite code. With a code, the game acts as
+// if launched with --fastmp, which it already supports: hosting uses its direct (ENet, UDP 33771) host instead of a
+// Steam lobby, and Join connects to 127.0.0.1. A helper (src/tailcat/cmd/sts2-tailcat) carries those ports through a
+// Tailcat tunnel: when hosting it prints the code to share; when joining it relays 127.0.0.1 to the code entered.
+// The game loads this assembly and applies the patches below (no ModInitializer, so it calls Harmony's PatchAll).
 static class Invite
 {
-	public static bool On;
+	public static bool On; // the current Host, Load or Join is by invite code
+	public static bool Bypass; // running the game's own Host, Load or Join after the choice
 	public const ushort GamePort = 33771;
 	const string ConfigPath = "user://tailcat_invites.cfg";
 
 	static Helper? _host, _join;
-	static string _invite = "";
+	static string _invite = "", _code = "";
 	static long _copiedAt = long.MinValue / 2;
 
 	public static void Log(string msg) => GD.Print("[TailcatInvites] " + msg);
@@ -60,13 +61,7 @@ static class Invite
 	public static async Task Join(NJoinFriendScreen screen)
 	{
 		StopJoin();
-		string invite = DisplayServer.ClipboardGet().Trim();
-		if (!invite.StartsWith("tc", StringComparison.Ordinal) || invite.Length < 20)
-		{
-			Overlay.Show("Copy the host's invite first, then choose Join again.", "", 6);
-			Back(screen);
-			return;
-		}
+		string invite = _code;
 		Overlay.Show("Connecting to the host…");
 		var ready = new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously);
 		_join = Helper.Start(new[] { "join", invite }, (kind, e) =>
@@ -76,7 +71,7 @@ static class Invite
 		});
 		if (_join == null)
 		{
-			Overlay.Show("Invite play isn't available: its helper is missing from the mod's folder.", "", 8);
+			Overlay.Show("Invite codes aren't available: the mod's helper is missing from its folder.", "", 8);
 			Back(screen);
 			return;
 		}
@@ -86,7 +81,7 @@ static class Invite
 		{
 			Log("couldn't connect: " + error);
 			StopJoin();
-			Overlay.Show("Couldn't connect with that invite. Check the host is still hosting, or ask for a new invite.", "", 8);
+			Overlay.Show("Couldn't connect with that code. Check the host is still hosting, or ask for a new code.", "", 8);
 			Back(screen);
 			return;
 		}
@@ -124,7 +119,7 @@ static class Invite
 		});
 		if (host == null)
 		{
-			Overlay.Show("Invite play isn't available: its helper is missing from the mod's folder.", "", 8);
+			Overlay.Show("Invite codes aren't available: the mod's helper is missing from its folder.", "", 8);
 			return;
 		}
 		_ = HostLoop(service, host);
@@ -137,9 +132,10 @@ static class Invite
 			if (NGame.Instance?.MainMenu != null) // the lobby; hide once the run starts
 			{
 				int players = service.ConnectedPeers.Count + 1;
-				if (_invite == "") Overlay.Show($"Hosting by invite · getting an invite… · {players} player{(players == 1 ? "" : "s")} here");
-				else Overlay.Show($"Hosting by invite · {players} player{(players == 1 ? "" : "s")} here",
-					System.Environment.TickCount64 - _copiedAt < 3000 ? "Copied" : "Copy invite");
+				string here = $"{players} player{(players == 1 ? "" : "s")} here";
+				if (_invite == "") Overlay.Show($"Hosting with an invite code · getting a code… · {here}");
+				else Overlay.Show($"Hosting with an invite code · send it to the others · {here}",
+					System.Environment.TickCount64 - _copiedAt < 3000 ? "Copied" : "Copy invite code");
 			}
 			else Overlay.Hide();
 			await Wait(1);
@@ -160,31 +156,60 @@ static class Invite
 		_copiedAt = System.Environment.TickCount64;
 	}
 
-	// ---- the toggle under Multiplayer ----
+	// ---- the choice: Steam or invite code ----
 
-	public static void AddToggle(NMultiplayerSubmenu menu)
+	const string CodeHint = "Anyone with the code can join, including on iPhone and iPad with the iOS port.";
+
+	public static void ChooseHost(Action host, bool load)
 	{
-		if (menu.FindChild("TailcatInvitesToggle", true, false) != null) return;
-		var toggle = new CheckButton
-		{
-			Name = "TailcatInvitesToggle",
-			Text = "Invite play (with iPhone/iPad and other invite players)",
-			ButtonPressed = On,
-			FocusMode = Control.FocusModeEnum.None,
-		};
-		toggle.AddThemeFontSizeOverride("font_size", 26);
-		if (ResourceLoader.Exists(Overlay.FontPath)) toggle.AddThemeFontOverride("font", GD.Load<Font>(Overlay.FontPath));
-		toggle.SizeFlagsHorizontal = Control.SizeFlags.ShrinkCenter;
-		toggle.Toggled += on =>
-		{
-			On = on;
-			SetFastMp(on);
-			Log(on ? "invite play on" : "invite play off");
-		};
-		var column = menu.GetNodeOrNull<Control>("ButtonContainer"); // Host, Join…: the toggle goes under them
-		(column ?? menu).AddChild(toggle);
-		Log($"added the Invite play toggle {(column != null ? "under the buttons" : "to the screen")}");
+		Dialog.Choose(load ? "Continue the multiplayer run" : "Host a multiplayer game",
+			"Through Steam, your Steam friends join you. With an invite code, you get a code to send to the others. " + CodeHint,
+			new[] { load ? "Continue via Steam" : "Host via Steam", load ? "Continue with an invite code" : "Host with an invite code" },
+			choice =>
+			{
+				if (choice < 0) return;
+				SetMode(choice == 1);
+				Run(host);
+			});
 	}
+
+	public static void ChooseJoin(Action join)
+	{
+		Dialog.Choose("Join a multiplayer game", "Join a Steam friend's game, or enter the invite code the host sent you. " + CodeHint,
+			new[] { "Join a Steam friend", "Join with an invite code" },
+			choice =>
+			{
+				if (choice == 0)
+				{
+					SetMode(false);
+					Run(join);
+				}
+				else if (choice == 1)
+					Dialog.AskCode(code =>
+					{
+						if (code == null) return;
+						_code = code;
+						SetMode(true);
+						Run(join);
+					});
+			});
+	}
+
+	static void Run(Action action)
+	{
+		Bypass = true;
+		try { action(); }
+		finally { Bypass = false; }
+	}
+
+	public static void SetMode(bool invite)
+	{
+		if (invite != On) Log(invite ? "using an invite code" : "using Steam");
+		On = invite;
+		SetFastMp(invite);
+	}
+
+	public static bool LooksLikeCode(string text) => text.StartsWith("tc", StringComparison.Ordinal) && text.Length > 20;
 
 	// The game's own command line arguments, where it looks for --fastmp. Set there rather than by patching
 	// CommandLineHelper.HasArg: that's small enough for the JIT to inline into its callers, past any patch.
@@ -363,12 +388,174 @@ static class Overlay
 	}
 }
 
+// Centered dialogs over a dimmed screen, styled like the banner.
+static class Dialog
+{
+	static readonly Color Gold = new(0.95f, 0.82f, 0.45f);
+
+	/// Calls done with the chosen option's index, or -1 for Cancel.
+	public static void Choose(string title, string text, string[] options, Action<int> done)
+	{
+		var (layer, column) = Open(title, text);
+		var row = Row(column);
+		for (int i = 0; i < options.Length; i++)
+		{
+			int choice = i;
+			var b = Button(options[i], () => { layer.QueueFree(); done(choice); });
+			row.AddChild(b);
+			if (i == 0) b.CallDeferred(Control.MethodName.GrabFocus);
+		}
+		row.AddChild(Button("Cancel", () => { layer.QueueFree(); done(-1); }));
+	}
+
+	/// Calls done with the code entered, or null for Cancel.
+	public static void AskCode(Action<string?> done)
+	{
+		var (layer, column) = Open("Join with an invite code",
+			"Ask the host to tap Copy invite code and send it to you, then paste it here.");
+		var field = new LineEdit
+		{
+			PlaceholderText = "Invite code (starts with tc)", CustomMinimumSize = new Vector2(820, 64),
+			SizeFlagsHorizontal = Control.SizeFlags.ExpandFill,
+		};
+		field.AddThemeFontSizeOverride("font_size", 24);
+		string clip = DisplayServer.ClipboardGet().Trim();
+		if (Invite.LooksLikeCode(clip)) field.Text = clip;
+		column.AddChild(field);
+		var error = new Label { Visible = false };
+		error.AddThemeColorOverride("font_color", new Color(1f, 0.6f, 0.5f));
+		error.AddThemeFontSizeOverride("font_size", 22);
+		column.AddChild(error);
+		void Submit()
+		{
+			string code = field.Text.Trim();
+			if (!Invite.LooksLikeCode(code))
+			{
+				error.Text = "That isn't an invite code. Copy the whole code the host sent (it starts with tc).";
+				error.Visible = true;
+				return;
+			}
+			layer.QueueFree();
+			done(code);
+		}
+		field.TextSubmitted += _ => Submit();
+		var row = Row(column);
+		row.AddChild(Button("Paste", () => field.Text = DisplayServer.ClipboardGet().Trim()));
+		row.AddChild(Button("Join", Submit));
+		row.AddChild(Button("Cancel", () => { layer.QueueFree(); done(null); }));
+		field.CallDeferred(Control.MethodName.GrabFocus);
+	}
+
+	static (CanvasLayer, VBoxContainer) Open(string title, string text)
+	{
+		var layer = new CanvasLayer { Layer = 120, ProcessMode = Node.ProcessModeEnum.Always };
+		var dim = new ColorRect { Color = new Color(0, 0, 0, 0.7f) };
+		dim.SetAnchorsPreset(Control.LayoutPreset.FullRect);
+		layer.AddChild(dim);
+		var center = new CenterContainer();
+		center.SetAnchorsPreset(Control.LayoutPreset.FullRect);
+		layer.AddChild(center);
+		var panel = new PanelContainer { CustomMinimumSize = new Vector2(900, 0) };
+		var box = new StyleBoxFlat
+		{
+			BgColor = new Color(0.08f, 0.09f, 0.12f, 0.97f), BorderColor = Gold,
+			ContentMarginLeft = 36, ContentMarginRight = 36, ContentMarginTop = 28, ContentMarginBottom = 28,
+		};
+		box.SetBorderWidthAll(3);
+		box.SetCornerRadiusAll(18);
+		panel.AddThemeStyleboxOverride("panel", box);
+		center.AddChild(panel);
+		var column = new VBoxContainer();
+		column.AddThemeConstantOverride("separation", 18);
+		panel.AddChild(column);
+		var heading = new Label { Text = title };
+		heading.AddThemeFontSizeOverride("font_size", 36);
+		heading.AddThemeColorOverride("font_color", Gold);
+		Font(heading);
+		column.AddChild(heading);
+		var body = new Label { Text = text, AutowrapMode = TextServer.AutowrapMode.WordSmart, CustomMinimumSize = new Vector2(820, 0) };
+		body.AddThemeFontSizeOverride("font_size", 24);
+		column.AddChild(body);
+		((SceneTree)Engine.GetMainLoop()).Root.AddChild(layer);
+		return (layer, column);
+	}
+
+	static HBoxContainer Row(VBoxContainer column)
+	{
+		var row = new HBoxContainer { Alignment = BoxContainer.AlignmentMode.End };
+		row.AddThemeConstantOverride("separation", 16);
+		column.AddChild(row);
+		return row;
+	}
+
+	static Button Button(string text, Action pressed)
+	{
+		var b = new Button { Text = text, CustomMinimumSize = new Vector2(180, 60) };
+		b.AddThemeFontSizeOverride("font_size", 24);
+		foreach (var state in new[] { "normal", "hover", "pressed", "focus" })
+		{
+			var box = new StyleBoxFlat
+			{
+				BgColor = state == "pressed" ? new Color(0.3f, 0.26f, 0.14f) : state == "hover" ? new Color(0.22f, 0.22f, 0.28f) : new Color(0.16f, 0.17f, 0.22f),
+				BorderColor = new Color(Gold, state == "focus" ? 1f : 0.8f),
+				ContentMarginLeft = 18, ContentMarginRight = 18, ContentMarginTop = 8, ContentMarginBottom = 8,
+			};
+			box.SetBorderWidthAll(state == "focus" ? 3 : 2);
+			box.SetCornerRadiusAll(12);
+			b.AddThemeStyleboxOverride(state, box);
+		}
+		Font(b);
+		b.Pressed += pressed;
+		return b;
+	}
+
+	static void Font(Control c)
+	{
+		if (ResourceLoader.Exists(Overlay.FontPath)) c.AddThemeFontOverride("font", GD.Load<Font>(Overlay.FontPath));
+	}
+}
+
 // ---- patches ----
 
-[HarmonyPatch(typeof(NMultiplayerSubmenu), nameof(NMultiplayerSubmenu._Ready))]
-static class AddToggle
+[HarmonyPatch(typeof(NMultiplayerSubmenu), "OnHostPressed")]
+static class AskHowToHost
 {
-	static void Postfix(NMultiplayerSubmenu __instance) => Invite.AddToggle(__instance);
+	static bool Prefix(NMultiplayerSubmenu __instance, object __0)
+	{
+		if (Invite.Bypass) return true;
+		Invite.ChooseHost(() => AccessTools.Method(typeof(NMultiplayerSubmenu), "OnHostPressed").Invoke(__instance, new[] { __0 }), false);
+		return false;
+	}
+}
+
+[HarmonyPatch(typeof(NMultiplayerSubmenu), "StartLoad")]
+static class AskHowToLoad
+{
+	static bool Prefix(NMultiplayerSubmenu __instance, object __0)
+	{
+		if (Invite.Bypass) return true;
+		Invite.ChooseHost(() => AccessTools.Method(typeof(NMultiplayerSubmenu), "StartLoad").Invoke(__instance, new[] { __0 }), true);
+		return false;
+	}
+}
+
+[HarmonyPatch(typeof(NMultiplayerSubmenu), "OpenJoinFriendsScreen")]
+static class AskHowToJoin
+{
+	static bool Prefix(NMultiplayerSubmenu __instance, object __0)
+	{
+		if (Invite.Bypass) return true;
+		Invite.ChooseJoin(() => AccessTools.Method(typeof(NMultiplayerSubmenu), "OpenJoinFriendsScreen").Invoke(__instance, new[] { __0 }));
+		return false;
+	}
+}
+
+// Back on the Multiplayer screen, the next Host, Load or Join asks again; until then the game stays on Steam (e.g.
+// for invites accepted in the Steam overlay).
+[HarmonyPatch(typeof(NMultiplayerSubmenu), "OnSubmenuShown")]
+static class BackToSteam
+{
+	static void Postfix() => Invite.SetMode(false);
 }
 
 [HarmonyPatch(typeof(NJoinFriendScreen), "FastMpJoin")]
