@@ -164,7 +164,7 @@ static class Invite
 
 	public static void AddToggle(NMultiplayerSubmenu menu)
 	{
-		if (menu.HasNode("TailcatInvitesToggle")) return;
+		if (menu.FindChild("TailcatInvitesToggle", true, false) != null) return;
 		var toggle = new CheckButton
 		{
 			Name = "TailcatInvitesToggle",
@@ -174,18 +174,16 @@ static class Invite
 		};
 		toggle.AddThemeFontSizeOverride("font_size", 26);
 		if (ResourceLoader.Exists(Overlay.FontPath)) toggle.AddThemeFontOverride("font", GD.Load<Font>(Overlay.FontPath));
-		toggle.SetAnchorsPreset(Control.LayoutPreset.CenterBottom);
-		toggle.GrowHorizontal = Control.GrowDirection.Both;
-		toggle.GrowVertical = Control.GrowDirection.Begin;
-		toggle.OffsetBottom = -40;
+		toggle.SizeFlagsHorizontal = Control.SizeFlags.ShrinkCenter;
 		toggle.Toggled += on =>
 		{
 			On = on;
 			SetFastMp(on);
 			Log(on ? "invite play on" : "invite play off");
 		};
-		menu.AddChild(toggle);
-		Log("added the Invite play toggle");
+		var column = menu.GetNodeOrNull<Control>("ButtonContainer"); // Host, Join…: the toggle goes under them
+		(column ?? menu).AddChild(toggle);
+		Log($"added the Invite play toggle {(column != null ? "under the buttons" : "to the screen")}");
 	}
 
 	// The game's own command line arguments, where it looks for --fastmp. Set there rather than by patching
