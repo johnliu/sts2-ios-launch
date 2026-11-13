@@ -181,9 +181,36 @@ static class Invite
 		toggle.Toggled += on =>
 		{
 			On = on;
+			SetFastMp(on);
 			Log(on ? "invite play on" : "invite play off");
 		};
 		menu.AddChild(toggle);
+		Log("added the Invite play toggle");
+	}
+
+	// The game's own command line arguments, where it looks for --fastmp. Set there rather than by patching
+	// CommandLineHelper.HasArg: that's small enough for the JIT to inline into its callers, past any patch.
+	static readonly Godot.Collections.Dictionary<string, string>? Args =
+		AccessTools.Field(typeof(CommandLineHelper), "_args")?.GetValue(null) as Godot.Collections.Dictionary<string, string>;
+	static bool _addedFastMp;
+
+	static void SetFastMp(bool on)
+	{
+		if (Args == null)
+		{
+			Log("can't find the game's command line arguments; invite play won't work in this game version");
+			return;
+		}
+		if (on && !Args.ContainsKey("fastmp"))
+		{
+			Args["fastmp"] = "";
+			_addedFastMp = true;
+		}
+		else if (!on && _addedFastMp)
+		{
+			Args.Remove("fastmp");
+			_addedFastMp = false;
+		}
 	}
 }
 
@@ -339,17 +366,6 @@ static class Overlay
 }
 
 // ---- patches ----
-
-[HarmonyPatch(typeof(CommandLineHelper), nameof(CommandLineHelper.HasArg))]
-static class FastMpWhileInvitePlay
-{
-	static bool Prefix(string key, ref bool __result)
-	{
-		if (!Invite.On || key != "fastmp") return true;
-		__result = true;
-		return false;
-	}
-}
 
 [HarmonyPatch(typeof(NMultiplayerSubmenu), nameof(NMultiplayerSubmenu._Ready))]
 static class AddToggle
