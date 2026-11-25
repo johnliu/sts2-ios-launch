@@ -1,0 +1,95 @@
+diff --git a/core/io/resource_loader.cpp b/core/io/resource_loader.cpp
+index 813be09..0994f74 100644
+--- a/core/io/resource_loader.cpp
++++ b/core/io/resource_loader.cpp
+@@ -363,12 +363,36 @@ Ref<Resource> ResourceLoader::_load(const String &p_path, const String &p_origin
+ void ResourceLoader::_run_load_task(void *p_userdata) {
+ 	ThreadLoadTask &load_task = *(ThreadLoadTask *)p_userdata;
+ 
++	bool wait = false;
+ 	{
+ 		MutexLock thread_load_lock(thread_load_mutex);
+ 		if (cleaning_tasks) {
+ 			load_task.status = THREAD_LOAD_FAILED;
+ 			return;
+ 		}
++
++		if (load_task.started_load && load_task.started_by != Thread::get_caller_id()) {
++			wait = true;
++		} else {
++			load_task.started_load = true;
++			load_task.started_by = Thread::get_caller_id();
++		}
++	}
++
++	if (wait) {
++		// Another thread is already loading this (the task was restarted in _load_complete_inner
++		// and the pool also ran it, or several awaiting threads restarted it). Loading it twice at
++		// once corrupts the task's state, so wait for that thread to finish instead.
++		ThreadLoadStatus status;
++		do {
++			OS::get_singleton()->delay_usec(1000);
++			thread_load_mutex.lock();
++			status = load_task.status;
++			thread_load_mutex.unlock();
++		} while (status == THREAD_LOAD_IN_PROGRESS);
++
++		load_task.load_token->unreference();
++		return;
+ 	}
+ 
+ 	ThreadLoadTask *curr_load_task_backup = curr_load_task;
+@@ -818,14 +842,20 @@ Ref<Resource> ResourceLoader::_load_complete_inner(LoadToken &p_load_token, Erro
+ 			bool loader_is_wtp = load_task.task_id != 0;
+ 			if (loader_is_wtp) {
+ 				// Loading thread is in the worker pool.
++				bool running_elsewhere = load_task.started_load && load_task.started_by != Thread::get_caller_id();
+ 				p_thread_load_lock.temp_unlock();
+ 
+-				PREPARE_FOR_WTP_WAIT
+-				Error wait_err = WorkerThreadPool::get_singleton()->wait_for_task_completion(load_task.task_id);
+-				RESTORE_AFTER_WTP_WAIT
++				// A task that hasn't started yet is simply run here.
++				bool restart = true;
++				if (running_elsewhere) {
++					PREPARE_FOR_WTP_WAIT
++					Error wait_err = WorkerThreadPool::get_singleton()->wait_for_task_completion(load_task.task_id);
++					RESTORE_AFTER_WTP_WAIT
+ 
+-				DEV_ASSERT(!wait_err || wait_err == ERR_BUSY);
+-				if (wait_err == ERR_BUSY) {
++					DEV_ASSERT(!wait_err || wait_err == ERR_BUSY);
++					restart = wait_err == ERR_BUSY;
++				}
++				if (restart) {
+ 					// The WorkerThreadPool has reported that the current task wants to await on an older one.
+ 					// That't not allowed for safety, to avoid deadlocks. Fortunately, though, in the context of
+ 					// resource loading that means that the task to wait for can be restarted here to break the
+@@ -884,8 +914,11 @@ Ref<Resource> ResourceLoader::_load_complete_inner(LoadToken &p_load_token, Erro
+ 		if (curr_load_task) {
+ 			// A task awaiting another => Let the awaiter accumulate the resource changed connections.
+ 			DEV_ASSERT(curr_load_task != load_task_ptr);
+-			for (const ThreadLoadTask::ResourceChangedConnection &rcc : load_task_ptr->resource_changed_connections) {
+-				curr_load_task->resource_changed_connections.push_back(rcc);
++			if (!load_task_ptr->connections_propagated) {
++				for (const ThreadLoadTask::ResourceChangedConnection &rcc : load_task_ptr->resource_changed_connections) {
++					curr_load_task->resource_changed_connections.push_back(rcc);
++				}
++				load_task_ptr->connections_propagated = true;
+ 			}
+ 		} else {
+ 			// A leaf task being awaited => Propagate the resource changed connections.
+diff --git a/core/io/resource_loader.h b/core/io/resource_loader.h
+index d287386..90bf25c 100644
+--- a/core/io/resource_loader.h
++++ b/core/io/resource_loader.h
+@@ -191,6 +191,9 @@ private:
+ 		Error error = OK;
+ 		Ref<Resource> resource;
+ 		bool use_sub_threads = false;
++		bool started_load = false; // Set by the first thread that runs the task; any other thread waits for it.
++		Thread::ID started_by = Thread::UNASSIGNED_ID;
++		bool connections_propagated = false;
+ 		HashSet<String> sub_tasks;
+ 
+ 		struct ResourceChangedConnection {

@@ -14,7 +14,7 @@ project, not affiliated with or endorsed by Mega Crit.
 You need:
 
 - **A Mac** (Apple silicon recommended) with about 15 GB free.
-- **Slay the Spire 2 on Steam**, on the public branch: tested with **v0.107.1**. The beta branch's **v0.113.0** works
+- **Slay the Spire 2 on Steam**, on the public branch: tested with **v0.107.1**. The beta branch's **v0.113.1** works
   too (see [Playing the beta](#playing-the-beta)).
 - **An iPhone or iPad** on iOS 17 or later, and a cable to connect it to the Mac.
 - **An Apple ID.** A free one works (see [Keeping it working](#keeping-it-working)).
@@ -70,9 +70,9 @@ Replace `/path/to/Slay the Spire 2` with the folder from step 1. The easiest way
 window, and press Return.
 
 This one command does everything: it downloads the build tools, patches your copy of the game for iOS,
-compiles it, and installs the app on your phone. The first run downloads about 2 GB and takes roughly 5–15
-minutes. If something is wrong (no Apple ID in Xcode, wrong folder, phone not connected), it stops and tells you
-what to fix.
+compiles it, and installs the app on your phone. The first run downloads about 2 GB and takes roughly 10–30
+minutes, most of it compiling Godot's iOS engine (only the first time). If something is wrong (no Apple ID in
+Xcode, wrong folder, phone not connected), it stops and tells you what to fix.
 
 No Git? Click **Code** → **Download ZIP** on this page, unzip it, and `cd` into that folder instead of running
 `git clone`.
@@ -125,7 +125,14 @@ your saves (or skip that).
   - **Nearby, without Wi-Fi** (iOS 26, iPhone 12 or later): phones in the same room play over Wi-Fi Aware, with no
     router, shared network or IP address. Pair each pair of phones once (**Pair a phone** under Join, or on the
     host's banner), then the host's game shows up under Join as "*phone*, nearby". Builds signed with a free Apple ID
-    leave this out (Apple doesn't offer Wi-Fi Aware to them). Not yet tested between two phones.
+    leave this out (Apple doesn't offer Wi-Fi Aware to them).
+    - **Drops:** if the link drops (too far apart, walls, the other phone busy on its Wi-Fi network), the joining
+      phone reconnects by itself and the game carries on after a pause; it gives up after about 20 seconds. Both
+      phones need a build with this (an older build on either phone still plays, but can't reconnect). Reconnecting
+      is not yet tested between two phones. Keeping the phones close helps, and so does leaving the Wi-Fi network
+      while keeping Wi-Fi on, so the radio doesn't share its time with the network.
+    - **If a game ends anyway:** the host opens the pause menu → Save and Quit, then Multiplayer → Host from Save,
+      and the others join again (the game only lets players who were in the run rejoin it).
   - **By invite, from anywhere:** the host taps **Copy invite** on its banner and sends it (Messages, etc.); the
     other player copies it and taps **Paste invite** under Join. The game travels through an encrypted
     [Tailcat](https://github.com/tailscale/tailcat) tunnel (WireGuard, set up through Tailscale's public relays, phone to
@@ -143,6 +150,11 @@ your saves (or skip that).
 - **120 FPS by default** on ProMotion iPhones (the game's default is 60); change it in Settings → FPS. To save
   battery and heat, the screen drops to 60 Hz after 2 seconds without touches or animations, and returns to 120 the
   moment you touch it or something moves.
+- **Combat backgrounds drawn at the resolution of their art** (1 pixel per game unit, e.g. 1680×1182 on an open
+  iPhone Duo) and scaled up to the screen, while creatures, cards and text stay at full resolution. The art has
+  about 0.74 texels per unit, so no detail is lost, and the background takes the GPU less than half as long. This
+  matters most in the Underdocks and its bosses, whose backgrounds stack around 20 full-screen shader overlays
+  and as many screen-sized glows: those fights dropped to 35–60 fps on an open iPhone Duo.
 - Sound and music through FMOD (they follow the silent switch).
 - **Extra custom-run modifiers** (singleplayer only), at the bottom of Singleplayer → Custom → modifiers:
   - **Supercharged:** 20 extra Energy every turn.
@@ -170,7 +182,7 @@ anyone joining. Everyone still needs the same game version. Not yet tested in a 
 
 ## Playing the beta
 
-To play the beta (v0.113.0: the Fool, Blitz and Dread), switch Slay the Spire 2 to `public-beta` in Steam
+To play the beta (v0.113.1: the Fool, Blitz and Dread), switch Slay the Spire 2 to `public-beta` in Steam
 (Properties → Game Versions & Betas), let it update, copy the game files again and rebuild. The beta's new lobbies
 (Blitz and Dread) get the same 6-player hosting as standard and custom runs.
 
@@ -246,9 +258,13 @@ Godot 4.5's iOS runtime doesn't use the UIScene app lifecycle, which apps built 
 (they're stopped at launch otherwise) and which the Duo needs to resize apps. The build adds it
 ([`src/ios/scene_delegate.cpp`](src/ios/scene_delegate.cpp)).
 
-The game stays landscape in every pose. A real iPhone Duo can still resize it to the upright outer screen while
-it's in the background (folded and held upright in another app); the game then asks iOS to turn it back to landscape
-([`src/ios/scene_delegate.cpp`](src/ios/scene_delegate.cpp)).
+The game stays landscape in every pose. A real iPhone Duo can still turn it upright (folding, opening, or folded and
+held upright in another app): like an iPad, it can ignore an app's orientation list. So on the Duo the game also locks
+its orientation while it's landscape (iOS 26's `prefersInterfaceOrientationLocked`). Folded, turning the phone to the
+other landscape side still turns the game round; open, it stays the way round it opened. If it ever ends up upright
+it unlocks and asks iOS to turn it back to landscape
+([`src/ios/scene_delegate.cpp`](src/ios/scene_delegate.cpp)). `godot.log` records each change as
+`[PORT] orientation`. Phones without a hinge rely on Info.plist alone, as before.
 
 Tested in the iPhone Duo Simulator (`--simulator`) closed, half open and open, both ways round, and played on a real
 iPhone Duo (iOS 27.2).
@@ -260,7 +276,7 @@ iPhone Duo (iOS 27.2).
 - **Folder path with a space in it:** the build goes to `~/Library/Caches/sts2-ios-launch` instead of
   `build/`, because .NET's iOS linker can't handle spaces in paths. The script prints where the result is.
 - **"patching sts2.dll failed":** your game version differs from the ones this was made for (v0.107.1 on the
-  public branch, v0.113.0 on the beta). Switch Slay the Spire 2 to one of them (Properties → Game Versions &
+  public branch, v0.113.1 on the beta). Switch Slay the Spire 2 to one of them (Properties → Game Versions &
   Betas), let it update, and copy the files again.
 - **Signing or provisioning errors:** check your Apple ID is in Xcode → Settings → Accounts, and that your
   device is connected, unlocked and trusted. With a free Apple ID, Apple allows 3 sideloaded apps at a time
@@ -290,8 +306,12 @@ The game is made with Godot (Mega Crit's fork of Godot 4.5) and C#. Its data (`S
 (`sts2.dll`) don't depend on the platform, so the build assembles them into an iOS app:
 
 1. **Engine:** exports an empty Godot 4.5.1 C# project ([`src/godot`](src/godot)) for iOS. That produces an
-   Xcode project with the stock iOS engine and the FMOD and Spine extensions the game uses. Spine's iOS library
-   is rebuilt from its 4.2 source with [`src/spine/no-gpu-readback.patch`](src/spine/no-gpu-readback.patch):
+   Xcode project with Godot's iOS engine and the FMOD and Spine extensions the game uses. The engine library is
+   compiled from Godot 4.5.1's source with
+   [`src/engine/threaded-load-race.patch`](src/engine/threaded-load-race.patch), a backport of Godot 4.7's fix
+   for background loading ([godot#118085](https://github.com/godotengine/godot/issues/118085)): stock 4.5.1 can
+   load a file on two threads at once, which corrupts memory and crashes the game minutes later. Spine's iOS
+   library is rebuilt from its 4.2 source with [`src/spine/no-gpu-readback.patch`](src/spine/no-gpu-readback.patch):
    the prebuilt one reads each changed character mesh back from the GPU, which froze the game for 30–40 ms on
    attacks and hits.
 2. **Patching:** patches the game's `sts2.dll` with Mono.Cecil ([`src/patcher`](src/patcher)) to add hooks for
@@ -308,6 +328,8 @@ The game is made with Godot (Mega Crit's fork of Godot 4.5) and C#. Its data (`S
 4. **Data:** adds the port's settings and scripts ([`src/pck`](src/pck)) to a copy of the game's `.pck`:
    - touch input
    - display and safe-area layout
+   - combat backgrounds rendered at their art's resolution in a second viewport
+     ([`src/pck/port/background_res.gd`](src/pck/port/background_res.gd))
    - the Steam Cloud screens
    - the multiplayer join and host screens
    - your copy's `release_info.json` (the game version that multiplayer compares)
@@ -321,7 +343,7 @@ The game is made with Godot (Mega Crit's fork of Godot 4.5) and C#. Its data (`S
 These tools are downloaded from their official sources during the build. None of them are included here:
 
 - [.NET SDK](https://dotnet.microsoft.com)
-- [Godot](https://godotengine.org)
+- [Godot](https://godotengine.org) (the editor and export template, and its source for the iOS engine)
 - [GDRE Tools](https://github.com/GDRETools/gdsdecomp)
 - [fmod-gdextension](https://github.com/utopia-rise/fmod-gdextension), which includes FMOD, under
   [FMOD's license](https://www.fmod.com/licensing)

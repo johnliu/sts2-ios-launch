@@ -3,7 +3,7 @@
 set -euo pipefail
 
 TESTED_GAME_VERSION="v0.107.1" # Steam's public branch
-TESTED_BETA_VERSION="v0.113.0" # Steam's public-beta branch
+TESTED_BETA_VERSION="v0.114.0" # Steam's public-beta branch
 GODOT_VERSION="4.5.1"
 DOTNET_VERSION="9.0.318"
 GDRE_VERSION="2.7.0"
@@ -284,6 +284,26 @@ if [[ ! -f "$TOOLS/spine/.ok-ios-${SPINE_SRC_COMMIT:0:12}-$SPINE_PATCH_ID" ]]; t
 	rm -rf "$S"
 	touch "$TOOLS/spine/.ok-ios-${SPINE_SRC_COMMIT:0:12}-$SPINE_PATCH_ID"
 fi
+# Godot 4.5.1's background loading can run one load on two threads at once when a load needs a file that an older
+# background load is still reading (godotengine/godot#118085, fixed in Godot 4.7 by #118824). The two threads then
+# corrupt memory, and the game crashes minutes later, typically while entering a room. Build the iOS engine from the
+# same 4.5.1 sources with src/engine/threaded-load-race.patch, a backport of that fix, built like Godot's own.
+ENGINE_PATCH_ID="$(cat "$ROOT"/src/engine/*.patch | shasum | cut -c1-12)"
+ENGINE_IOS_LIB="$TOOLS/engine/libgodot.ios.template_release.arm64.a"
+if [[ ! -f "$TOOLS/engine/.ok-$GODOT_VERSION-$ENGINE_PATCH_ID" ]]; then
+	step "Building the Godot $GODOT_VERSION iOS engine from source with crash fixes (once; 10-30 min)"
+	E="$TOOLS/engine-build"; rm -rf "$E" "$TOOLS/engine" && mkdir -p "$E" "$TOOLS/engine"
+	run engine-clone git clone -q --depth 1 --branch "$GODOT_VERSION-stable" https://github.com/godotengine/godot.git "$E/godot"
+	for p in "$ROOT"/src/engine/*.patch; do run engine-patch git -C "$E/godot" apply "$p"; done
+	run engine-venv python3 -m venv "$E/venv"
+	run engine-scons-install "$E/venv/bin/pip" install -q "scons==4.11.1"
+	(cd "$E/godot" && run engine-scons "$E/venv/bin/scons" -j"$(sysctl -n hw.ncpu)" platform=ios arch=arm64 target=template_release \
+		production=yes lto=none module_mono_enabled=yes \
+		APPLE_TOOLCHAIN_PATH="$DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain" IOS_SDK_PATH="$IOS_SDK")
+	cp "$E/godot/bin/libgodot.ios.template_release.arm64.a" "$ENGINE_IOS_LIB"
+	rm -rf "$E"
+	touch "$TOOLS/engine/.ok-$GODOT_VERSION-$ENGINE_PATCH_ID"
+fi
 TOOLS_ID="godot $GODOT_VERSION dotnet $DOTNET_VERSION gdre $GDRE_VERSION fmod $FMOD_GDE_VERSION spine $SPINE_VERSION ios ${SPINE_SRC_COMMIT:0:12} $SPINE_PATCH_ID"
 PCK_ID="$(stat -f '%z %m' "$PCK") $PCK"
 
@@ -317,8 +337,9 @@ if ! up_to_date icon "$FP" || [[ ! -f "$WORK/icon.png" ]]; then
 fi
 
 # ---------------------------------------------------------------------------------------------------- Xcode project
-# Export an empty Godot C# project (named like the game's assembly) as an Xcode project: this provides the stock
-# Godot 4.5.1 iOS engine with FMOD and Spine. The game's code and data are swapped in afterwards.
+# Export an empty Godot C# project (named like the game's assembly) as an Xcode project: this provides the Godot 4.5.1
+# iOS app with FMOD and Spine (its engine library is swapped for the one built above). The game's code and data are
+# swapped in afterwards.
 X="$WORK/xcode"
 FP="$(fingerprint "$ROOT/src/godot" "$ROOT/src/ios" "$WORK/icon.png" "$EXPORT_TEAM $BUNDLE_ID $SHORT_VERSION plist-bgaudio-scene-wifiaware" "$TOOLS_ID")"
 if ! up_to_date export "$FP" || [[ ! -d "$X/sts2.xcodeproj" ]]; then
@@ -368,6 +389,10 @@ if ! up_to_date export "$FP" || [[ ! -d "$X/sts2.xcodeproj" ]]; then
 fi
 FRAMEWORK="$X/sts2/dylibs/ExportRelease/sts2_aot.xcframework/ios-arm64/sts2.framework"
 [[ -d "$FRAMEWORK" ]] || die "unexpected Godot export layout: $FRAMEWORK missing"
+# The engine built from source above replaces the export template's (the Simulator copy below is made from this one).
+ENGINE_LIB="$X/sts2.xcframework/ios-arm64/libgodot.a"
+[[ -f "$ENGINE_LIB" ]] || die "unexpected Godot export layout: $ENGINE_LIB missing"
+cmp -s "$ENGINE_IOS_LIB" "$ENGINE_LIB" || cp "$ENGINE_IOS_LIB" "$ENGINE_LIB"
 
 # ---------------------------------------------------------------------------------------------------- game code
 # IL-patch the game's sts2.dll (Steam Cloud saves, direct-IP multiplayer, iOS fixes) and stock GodotSharp, then

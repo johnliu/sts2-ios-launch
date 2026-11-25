@@ -13,7 +13,7 @@ static unsafe class PortNearby
 {
 	static bool _loaded;
 	static delegate* unmanaged<int> _supported, _joinState, _pairedCount;
-	static delegate* unmanaged<IntPtr> _status, _hosts;
+	static delegate* unmanaged<IntPtr> _status, _hosts, _events;
 	static delegate* unmanaged<int, void> _host, _browse;
 	static delegate* unmanaged<ulong, void> _join;
 	static delegate* unmanaged<void> _leave, _pair;
@@ -29,6 +29,7 @@ static unsafe class PortNearby
 		_pairedCount = (delegate* unmanaged<int>)F("port_nearby_paired_count");
 		_status = (delegate* unmanaged<IntPtr>)F("port_nearby_status");
 		_hosts = (delegate* unmanaged<IntPtr>)F("port_nearby_hosts");
+		_events = (delegate* unmanaged<IntPtr>)F("port_nearby_events");
 		_host = (delegate* unmanaged<int, void>)F("port_nearby_host");
 		_browse = (delegate* unmanaged<int, void>)F("port_nearby_browse");
 		_join = (delegate* unmanaged<ulong, void>)F("port_nearby_join");
@@ -80,10 +81,19 @@ static unsafe class PortNearby
 
 	public static void Join(ulong device) { if (Supported) _join(device); }
 
-	/// 0 not joined, 1 connecting, 2 ready (join 127.0.0.1), 3 failed or disconnected.
+	/// 0 not joined, 1 connecting, 2 ready (join 127.0.0.1; also while reconnecting a dropped link), 3 failed or
+	/// disconnected.
 	public static int JoinState => Supported ? _joinState() : 0;
 
 	public static void Leave() { if (Supported) _leave(); }
+
+	/// Relay events since the last call: links dropping, reconnecting or giving up.
+	public static string[] DrainEvents()
+	{
+		if (!Supported || _events == null) return Array.Empty<string>();
+		string s = Marshal.PtrToStringUTF8(_events()) ?? "";
+		return s.Length == 0 ? Array.Empty<string>() : s.Split('\n');
+	}
 
 	/// Shows Apple's pairing screens.
 	public static void Pair() { if (Supported) _pair(); }
