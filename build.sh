@@ -3,7 +3,7 @@
 set -euo pipefail
 
 TESTED_GAME_VERSION="v0.107.1" # Steam's public branch
-TESTED_BETA_VERSION="v0.113.1" # Steam's public-beta branch
+TESTED_BETA_VERSION="v0.114.0" # Steam's public-beta branch
 GODOT_VERSION="4.5.1"
 DOTNET_VERSION="9.0.318"
 GDRE_VERSION="2.7.0"
