@@ -10,6 +10,14 @@
 // One Wi-Fi Aware (TCP) connection per joining phone carries both ports: frames of [port index][length (2 bytes)]
 // [datagram]. Phones must be paired once per pair through Apple's pairing screens (port_nearby_pair).
 //
+// Dropped links: the joining phone starts every connection with a hello frame carrying a token for this join, and
+// both phones send a keepalive frame every second. When the link fails, or goes quiet for a few seconds after
+// keepalives were heard, the joining phone dials the host again (the same endpoint, then a fresh search for that
+// phone) and says hello with the same token, and the host gives the new connection the same UDP sockets. The game's
+// UDP addresses never change, so ENet only sees a few seconds of lost packets and resends them (both phones wait
+// 20 s before dropping a player: ENetHost.DoClientHandshake, PortMultiplayer.ExtendNearbyTimeout). Older builds
+// ignore these frames and work as before, without reconnecting.
+//
 // C entry points (src/native/Port/PortNearby.cs), called on the main thread.
 import DeviceDiscoveryUI
 import Foundation
@@ -20,7 +28,12 @@ import WiFiAware
 
 private let serviceName = "_sts2port._tcp" // Info.plist WiFiAwareServices (build.sh)
 private let gamePorts: [UInt16] = [33771, 33772]
-private let maxDatagram = 65_535
+private let helloFrame = 0xFF // joining phone -> host, first frame of every connection: the join's token (8 bytes)
+private let keepaliveFrame = 0xFE // both ways, every second
+private let joinQuietLimit: Duration = .seconds(4) // joining phone: dial again after this long without a frame
+private let hostQuietLimit: Duration = .seconds(10) // host: close a connection this quiet (the joiner redials)
+private let redialFor: Duration = .seconds(25) // the game gives up on the host after 20 s
+private let redialGrace: Duration = .seconds(30) // host: keeps a joining phone's game sockets this long for a redial
 
 // MARK: C entry points
 
@@ -89,15 +102,69 @@ public func port_nearby_paired_count() -> Int32 {
 	return 0
 }
 
+/// Relay events since the last call (drops, reconnects), one per line; "" if none.
+@_cdecl("port_nearby_events")
+public func port_nearby_events() -> UnsafePointer<CChar> {
+	let list = relayEvents.modify { events -> [String] in
+		defer { events.removeAll() }
+		return events
+	}
+	return cString(list.joined(separator: "\n"))
+}
+
 /// Shows Apple's pairing screens (make this phone visible / find the other phone).
 @_cdecl("port_nearby_pair")
 public func port_nearby_pair() {
 	if #available(iOS 26.0, *) { MainActor.assumeIsolated { Nearby.shared.showPairing() } }
 }
 
+// MARK: shared state
+
+/// A value used from several threads.
+private final class Locked<Value>: @unchecked Sendable {
+	private let lock = NSLock()
+	private var stored: Value
+
+	init(_ value: Value) { stored = value }
+
+	var value: Value {
+		lock.lock()
+		defer { lock.unlock() }
+		return stored
+	}
+
+	func set(_ value: Value) {
+		lock.lock()
+		stored = value
+		lock.unlock()
+	}
+
+	@discardableResult
+	func modify<Result>(_ body: (inout Value) -> Result) -> Result {
+		lock.lock()
+		defer { lock.unlock() }
+		return body(&stored)
+	}
+}
+
+/// Relay events for the game's log (port_nearby_events).
+private let relayEvents = Locked<[String]>([])
+
+private func note(_ event: String) {
+	relayEvents.modify { if $0.count < 100 { $0.append(event) } }
+}
+
+private func elapsed(since start: ContinuousClock.Instant) -> String {
+	let d = (ContinuousClock.now - start).components
+	return String(format: "%.1f s", Double(d.seconds) + Double(d.attoseconds) / 1e18)
+}
+
+/// A short name for a joining phone in the log.
+private func short(_ token: UInt64) -> String { String(String(token, radix: 16).prefix(4)) }
+
 // MARK: frames
 
-/// One datagram for one of the game's ports, as sent over a Wi-Fi Aware connection.
+/// One datagram for one of the game's ports (or a hello / keepalive), as sent over a Wi-Fi Aware connection.
 private func frame(_ port: Int, _ payload: Data) -> Data {
 	var d = Data(capacity: payload.count + 3)
 	d.append(UInt8(port))
@@ -148,7 +215,7 @@ private func readFrames(_ link: Link, _ deliver: (Int, Data) -> Void) async thro
 		let length = Int(head[head.startIndex + 1]) << 8 | Int(head[head.startIndex + 2])
 		let (body, _) = length > 0 ? try await link.receive(exactly: length) : (Data(), nil)
 		if body.count < length { return }
-		if port < gamePorts.count { deliver(port, body) }
+		deliver(port, body)
 	}
 }
 
@@ -162,63 +229,255 @@ private func receiveLoop(_ udp: NWConnection, _ deliver: @escaping (Data) -> Voi
 
 private let relayQueue = DispatchQueue(label: "port.nearby.relay", qos: .userInteractive)
 
+/// One Wi-Fi Aware connection: sends frames in order, reads them, sends a keepalive every second, and ends (once,
+/// reporting why) when it fails, the other phone closes it, or it goes quiet after the other phone's keepalives were
+/// heard (a phone without keepalives is never cut off for being quiet). armed: the other phone is known to send
+/// keepalives, so it must be heard from within the quiet limit from the start.
+@available(iOS 26.0, *)
+private final class Wire: @unchecked Sendable {
+	let link: Link
+	private let quietLimit: Duration
+	private let ended = Locked(false)
+	private let lastHeard: Locked<ContinuousClock.Instant?> // nil until the other phone sends a keepalive
+	private let heard = Locked(false)
+	private let heardKeepalive = Locked(false)
+	private var outbox: Outbox?
+	private var tasks: [Task<Void, Never>] = []
+
+	init(_ link: Link, quietLimit: Duration, armed: Bool = false) {
+		self.link = link
+		self.quietLimit = quietLimit
+		lastHeard = Locked(armed ? .now : nil)
+	}
+
+	var isEnded: Bool { ended.value }
+	var hasHeard: Bool { heard.value }
+	var sendsKeepalives: Bool { heardKeepalive.value }
+
+	func send(_ port: Int, _ payload: Data) { outbox?.send(port, payload) }
+
+	/// deliver: every frame but keepalives, on a reader task. onEnd: called at most once.
+	func start(deliver: @escaping @Sendable (Int, Data) -> Void, onEnd: @escaping @Sendable (String) -> Void) {
+		outbox = Outbox(link) { [weak self] error in self?.end("couldn't send (\(error))", onEnd) }
+		let link = self.link
+		tasks.append(Task { [weak self] in
+			var why = "closed by the other phone"
+			do {
+				try await readFrames(link) { port, data in
+					guard let self else { return }
+					self.heard.set(true)
+					if port == keepaliveFrame { self.heardKeepalive.set(true) }
+					if port == keepaliveFrame || self.lastHeard.value != nil { self.lastHeard.set(.now) }
+					if port != keepaliveFrame { deliver(port, data) }
+				}
+			} catch {
+				why = "couldn't receive (\(error))"
+			}
+			self?.end(why, onEnd)
+		})
+		tasks.append(Task { [weak self] in
+			while !Task.isCancelled { // the first keepalive goes out at once: a redialing phone waits for it
+				guard let self, !self.isEnded else { return }
+				self.outbox?.send(keepaliveFrame, Data())
+				if let heard = self.lastHeard.value, ContinuousClock.now - heard > self.quietLimit {
+					self.end("nothing received for \(elapsed(since: heard))", onEnd)
+					return
+				}
+				try? await Task.sleep(for: .seconds(1))
+			}
+		})
+	}
+
+	private func end(_ why: String, _ onEnd: (String) -> Void) {
+		let first = ended.modify { e -> Bool in
+			defer { e = true }
+			return !e
+		}
+		guard first else { return }
+		close()
+		onEnd(why)
+	}
+
+	/// Stops without reporting (its owner is done with it).
+	func close() {
+		ended.set(true)
+		tasks.forEach { $0.cancel() }
+		outbox?.close()
+	}
+}
+
 // MARK: host side
 
-/// A joining phone: its Wi-Fi Aware connection and its two UDP sockets to the game on this phone.
+/// A joining phone, on the host: its two UDP sockets to the game on this phone, and its current connection.
 @available(iOS 26.0, *)
-private final class HostPeer: @unchecked Sendable {
-	let link: Link
-	let created = ContinuousClock.now
-	var udp: [NWConnection] = []
-	var outbox: Outbox?
-	var reader: Task<Void, Never>?
-	var ready = false
-	var closed = false
+private final class HostSession: @unchecked Sendable {
+	let token: UInt64? // nil: a build without hello frames (one connection, no redial)
+	let wire = Locked<Wire?>(nil)
+	var expiry: Task<Void, Never>? // guarded by HostRelay's lock
+	private var udp: [NWConnection] = []
 
-	init(_ link: Link) { self.link = link }
-
-	func start(onClose: @escaping @MainActor (HostPeer) -> Void) {
-		outbox = Outbox(link) { _ in Task { @MainActor in onClose(self) } }
+	init(token: UInt64?) {
+		self.token = token
 		for (i, port) in gamePorts.enumerated() {
 			let conn = NWConnection(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: port)!, using: .udp)
 			conn.start(queue: relayQueue)
-			receiveLoop(conn) { [weak self] data in self?.outbox?.send(i, data) }
+			receiveLoop(conn) { [weak self] data in self?.wire.value?.send(i, data) }
 			udp.append(conn)
-		}
-		reader = Task { [weak self] in
-			guard let self else { return }
-			do {
-				try await readFrames(self.link) { port, data in
-					self.udp[port].send(content: data, completion: .idempotent)
-				}
-			} catch {}
-			await MainActor.run { onClose(self) }
 		}
 	}
 
+	/// A datagram from the joining phone for the game.
+	func deliver(_ port: Int, _ data: Data) {
+		if port < udp.count { udp[port].send(content: data, completion: .idempotent) }
+	}
+
 	func close() {
-		guard !closed else { return }
-		closed = true
-		reader?.cancel()
-		outbox?.close()
+		expiry?.cancel()
+		wire.value?.close()
+		wire.set(nil)
 		udp.forEach { $0.cancel() }
+	}
+}
+
+/// The host's side of nearby play: gives each incoming connection the game sockets of the phone its hello names.
+@available(iOS 26.0, *)
+private final class HostRelay: @unchecked Sendable {
+	private let lock = NSLock()
+	private var sessions: [UInt64: HostSession] = [:]
+	private var legacy: [ObjectIdentifier: HostSession] = [:]
+	private var stopped = false
+	private var redialCount = 0
+
+	var connected: Int {
+		lock.lock()
+		defer { lock.unlock() }
+		return sessions.values.filter { $0.wire.value != nil }.count + legacy.count
+	}
+
+	var redials: Int {
+		lock.lock()
+		defer { lock.unlock() }
+		return redialCount
+	}
+
+	func adopt(_ link: Link) {
+		let wire = Wire(link, quietLimit: hostQuietLimit)
+		let session = Locked<HostSession?>(nil)
+		wire.start(deliver: { [weak self] port, data in
+			if let s = session.value {
+				if port != helloFrame { s.deliver(port, data) }
+				return
+			}
+			// The first frame says which phone this is.
+			guard let self else { return }
+			if port == helloFrame, data.count == 8 {
+				let token = UInt64(littleEndian: data.withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) })
+				session.set(self.attach(wire, token: token))
+			} else {
+				let s = self.attachLegacy(wire)
+				session.set(s)
+				s?.deliver(port, data)
+			}
+		}, onEnd: { [weak self] why in self?.detach(wire, session.value, why) })
+	}
+
+	private func attach(_ wire: Wire, token: UInt64) -> HostSession? {
+		lock.lock()
+		defer { lock.unlock() }
+		guard !stopped else {
+			wire.close()
+			return nil
+		}
+		let s: HostSession
+		if let existing = sessions[token] {
+			s = existing
+			redialCount += 1
+			note("phone \(short(token)) reconnected")
+		} else {
+			s = HostSession(token: token)
+			sessions[token] = s
+			note("phone \(short(token)) connected")
+		}
+		s.expiry?.cancel()
+		s.expiry = nil
+		let old = s.wire.value
+		s.wire.set(wire)
+		if old !== wire { old?.close() }
+		return s
+	}
+
+	private func attachLegacy(_ wire: Wire) -> HostSession? {
+		lock.lock()
+		defer { lock.unlock() }
+		guard !stopped else {
+			wire.close()
+			return nil
+		}
+		let s = HostSession(token: nil)
+		s.wire.set(wire)
+		legacy[ObjectIdentifier(wire)] = s
+		note("a phone with an older build connected (it can't reconnect after a drop)")
+		return s
+	}
+
+	private func detach(_ wire: Wire, _ session: HostSession?, _ why: String) {
+		lock.lock()
+		defer { lock.unlock() }
+		guard let s = session, s.wire.value === wire else { return }
+		s.wire.set(nil)
+		guard let token = s.token else {
+			legacy[ObjectIdentifier(wire)] = nil
+			s.close()
+			note("a phone with an older build disconnected: \(why)")
+			return
+		}
+		note("link to phone \(short(token)) dropped: \(why); waiting for it to reconnect")
+		s.expiry = Task { [weak self] in
+			try? await Task.sleep(for: redialGrace)
+			if !Task.isCancelled { self?.expire(token, s) }
+		}
+	}
+
+	private func expire(_ token: UInt64, _ s: HostSession) {
+		lock.lock()
+		defer { lock.unlock() }
+		guard sessions[token] === s, s.wire.value == nil else { return }
+		sessions[token] = nil
+		s.close()
+		note("phone \(short(token)) didn't reconnect")
+	}
+
+	func stop() {
+		lock.lock()
+		defer { lock.unlock() }
+		stopped = true
+		for s in Array(sessions.values) + Array(legacy.values) { s.close() }
+		sessions.removeAll()
+		legacy.removeAll()
 	}
 }
 
 // MARK: join side
 
-/// This phone's connection to a hosting phone, and the UDP listeners the game joins.
+/// This phone's side of a nearby game: the UDP listeners the game joins on 127.0.0.1, and the current connection
+/// to the host, replaced when it drops.
 @available(iOS 26.0, *)
-private final class JoinLink: @unchecked Sendable {
-	let link: Link
-	var listeners: [NWListener] = []
-	/// The game's own socket for each port (the latest one that sent something).
-	var game: [NWConnection?] = [nil, nil]
-	var outbox: Outbox?
-	var reader: Task<Void, Never>?
-	var closed = false
+private final class JoinRelay: @unchecked Sendable {
+	let device: UInt64
+	var endpoint: WAEndpoint // main actor
+	let token = UInt64.random(in: 1...UInt64.max)
+	let wire = Locked<Wire?>(nil)
+	let closed = Locked(false)
+	let hostSendsKeepalives = Locked(false) // a build that can take a redial
+	private let game = Locked<[NWConnection?]>([nil, nil]) // the game's own socket for each port (the latest one)
+	private var listeners: [NWListener] = []
 
-	init(_ link: Link) { self.link = link }
+	init(device: UInt64, endpoint: WAEndpoint) {
+		self.device = device
+		self.endpoint = endpoint
+	}
+
+	var hello: Data { withUnsafeBytes(of: token.littleEndian) { Data($0) } }
 
 	/// Listens on 127.0.0.1 for the game; throws if a port is taken (e.g. this phone is hosting).
 	func listen() throws {
@@ -229,34 +488,25 @@ private final class JoinLink: @unchecked Sendable {
 			let listener = try NWListener(using: params)
 			listener.newConnectionHandler = { [weak self] conn in
 				conn.start(queue: relayQueue)
-				relayQueue.async { self?.game[i] = conn }
-				receiveLoop(conn) { data in self?.outbox?.send(i, data) }
+				self?.game.modify { $0[i] = conn }
+				receiveLoop(conn) { data in self?.wire.value?.send(i, data) }
 			}
 			listener.start(queue: relayQueue)
 			listeners.append(listener)
 		}
 	}
 
-	func start(onClose: @escaping @MainActor () -> Void) {
-		outbox = Outbox(link) { _ in Task { @MainActor in onClose() } }
-		reader = Task { [weak self] in
-			guard let self else { return }
-			do {
-				try await readFrames(self.link) { port, data in
-					relayQueue.async { self.game[port]?.send(content: data, completion: .idempotent) }
-				}
-			} catch {}
-			await MainActor.run { onClose() }
-		}
+	/// A datagram from the host for the game.
+	func deliver(_ port: Int, _ data: Data) {
+		if port < gamePorts.count { game.value[port]?.send(content: data, completion: .idempotent) }
 	}
 
 	func close() {
-		guard !closed else { return }
-		closed = true
-		reader?.cancel()
-		outbox?.close()
+		closed.set(true)
+		wire.value?.close()
+		wire.set(nil)
 		listeners.forEach { $0.cancel() }
-		relayQueue.async { self.game.forEach { $0?.cancel() } }
+		game.value.forEach { $0?.cancel() }
 	}
 }
 
@@ -277,9 +527,11 @@ final class Nearby {
 	private var listenerTask: Task<Void, Never>?
 	private var browserTask: Task<Void, Never>?
 	private var pairedTask: Task<Void, Never>?
-	private var peers: [HostPeer] = []
+	private var hostRelay: HostRelay?
 	private var endpoints: [WAEndpoint] = []
-	private var joinLink: JoinLink?
+	private var joinRelay: JoinRelay?
+	private var redialTask: Task<Void, Never>?
+	private var joinRedials = 0
 	private(set) var joinState: Int32 = 0
 	private(set) var pairedCount: Int32 = -1
 	private var listenerState = "off"
@@ -300,9 +552,16 @@ final class Nearby {
 		guard Nearby.supported else { return "not supported on this device" }
 		let paired = pairedCount < 0 ? "?" : "\(pairedCount)"
 		var parts = ["\(paired) paired"]
-		if hosting { parts.append("hosting (\(listenerState), \(peers.filter { !$0.closed }.count) connected)") }
+		if hosting {
+			parts.append("hosting (\(listenerState), \(hostRelay?.connected ?? 0) connected, \(hostRelay?.redials ?? 0) reconnects)")
+		}
 		if browsing { parts.append("looking (\(browserState), \(endpoints.count) hosting)") }
-		if joinLink != nil || joinState != 0 { parts.append("joined: \(["no", "connecting", "ready", "failed"][Int(joinState)])") }
+		if joinRelay != nil || joinState != 0 {
+			var joined = "joined: \(["no", "connecting", "ready", "failed"][Int(joinState)])"
+			if redialTask != nil { joined += ", reconnecting" }
+			if joinRedials > 0 { joined += ", \(joinRedials) reconnects" }
+			parts.append(joined)
+		}
 		if !lastError.isEmpty { parts.append("last error: \(lastError)") }
 		return parts.joined(separator: "; ")
 	}
@@ -323,44 +582,34 @@ final class Nearby {
 		guard on != hosting, Nearby.supported else { return }
 		hosting = on
 		if on {
+			hostRelay = HostRelay()
 			startListener()
 		} else {
 			listenerTask?.cancel()
 			listenerTask = nil
 			listenerState = "off"
-			peers.forEach { $0.close() }
-			peers.removeAll()
+			hostRelay?.stop()
+			hostRelay = nil
 		}
 	}
 
-	/// Publishes until hosting stops. Publishing ends by itself after a while (connections stay up): start again.
+	/// Publishes until hosting stops. Publishing ends by itself after 2 minutes (connections stay up): start again.
 	private func startListener() {
 		guard listenerTask == nil, hosting, !pairingShown, let service = WAPublishableService.allServices[serviceName] else { return }
 		listenerTask = Task { [weak self] in
-			while let self, self.hosting, !Task.isCancelled {
+			while let self, self.hosting, !Task.isCancelled, let relay = self.hostRelay {
 				do {
 					let listener = try NetworkListener(
 						for: .wifiAware(.connecting(to: service, from: .allPairedDevices, datapath: .realtime)),
 						using: .parameters { TCP() }.wifiAware { $0.performanceMode = .realtime })
 						.onStateUpdate { _, state in Task { @MainActor in self.listenerState = "\(state)" } }
-					try await listener.run { link in self.adopt(link) }
+					try await listener.run { link in relay.adopt(link) }
 				} catch {
 					if Task.isCancelled { break }
 					self.lastError = "publishing: \(error)"
 				}
 				try? await Task.sleep(for: .seconds(1))
 			}
-		}
-	}
-
-	private func adopt(_ link: Link) {
-		guard hosting else { return }
-		let peer = HostPeer(link)
-		peers.append(peer)
-		peers.removeAll { $0.closed }
-		peer.start { [weak self] p in
-			p.close()
-			self?.peers.removeAll { $0 === p }
 		}
 	}
 
@@ -405,46 +654,136 @@ final class Nearby {
 			return
 		}
 		joinState = 1
-		let link = NetworkConnection(to: ep, using: .parameters { TCP() }.wifiAware { $0.performanceMode = .realtime })
-		let jl = JoinLink(link)
-		joinLink = jl
+		joinRedials = 0
+		let relay = JoinRelay(device: device, endpoint: ep)
+		joinRelay = relay
 		do {
-			try jl.listen()
+			try relay.listen()
 		} catch {
 			lastError = "local relay: \(error)"
-			fail(jl)
+			failJoin(relay)
 			return
 		}
-		link.onStateUpdate { [weak self] _, state in
-			Task { @MainActor in
-				guard let self, self.joinLink === jl else { return }
-				switch state {
+		Task { [weak self] in
+			guard let self else { return }
+			if await self.dial(relay, ep, within: .seconds(15)) {
+				if self.joinRelay === relay { self.joinState = 2 }
+			} else {
+				self.failJoin(relay)
+			}
+		}
+	}
+
+	/// Opens a connection to the host for this join and makes it the relay's. False if it isn't ready in time, or (when
+	/// the host is known to send keepalives) if the host isn't heard from: a connection alone doesn't prove the host's
+	/// game is still there.
+	private func dial(_ relay: JoinRelay, _ ep: WAEndpoint, within limit: Duration) async -> Bool {
+		let mustHear = relay.hostSendsKeepalives.value
+		let state = Locked(0) // 1 ready, 2 failed
+		let failure = Locked("")
+		let link = NetworkConnection(to: ep, using: .parameters { TCP() }.wifiAware { $0.performanceMode = .realtime })
+			.onStateUpdate { _, s in
+				switch s {
 				case .ready:
-					if self.joinState == 1 { self.joinState = 2 }
+					state.set(1)
 				case .failed(let error):
-					self.lastError = "connection: \(error)"
-					self.fail(jl)
+					failure.set("\(error)")
+					state.set(2)
 				case .cancelled:
-					self.fail(jl)
+					state.set(2)
 				default:
 					break
 				}
 			}
+		let wire = Wire(link, quietLimit: joinQuietLimit, armed: mustHear)
+		wire.start(deliver: { port, data in relay.deliver(port, data) },
+		           onEnd: { [weak self] why in Task { @MainActor in self?.linkEnded(relay, wire, why) } })
+		wire.send(helloFrame, relay.hello) // first, so the host knows which phone this is
+		let deadline = ContinuousClock.now + limit
+		func answered() -> Bool { state.value == 1 && (!mustHear || wire.hasHeard) }
+		while !answered(), state.value != 2, !wire.isEnded, !relay.closed.value, ContinuousClock.now < deadline {
+			try? await Task.sleep(for: .milliseconds(50))
 		}
-		jl.start { [weak self] in self?.fail(jl) }
+		guard answered(), !wire.isEnded, !relay.closed.value, joinRelay === relay else {
+			wire.close()
+			if !failure.value.isEmpty { lastError = "connection: \(failure.value)" }
+			return false
+		}
+		relay.wire.set(wire)
+		return true
 	}
 
-	private func fail(_ jl: JoinLink) {
-		jl.close()
-		if joinLink === jl {
-			joinLink = nil
+	private func linkEnded(_ relay: JoinRelay, _ wire: Wire, _ why: String) {
+		guard joinRelay === relay, !relay.closed.value, relay.wire.value === wire else { return }
+		relay.wire.set(nil)
+		if wire.sendsKeepalives { relay.hostSendsKeepalives.set(true) }
+		lastError = "link: \(why)"
+		note("link to the host dropped: \(why); reconnecting")
+		redial(relay)
+	}
+
+	/// Dials the host again until it answers or the game would have given up: first the endpoint we had, then
+	/// wherever a fresh search finds that phone.
+	private func redial(_ relay: JoinRelay) {
+		guard redialTask == nil else { return }
+		let started = ContinuousClock.now
+		redialTask = Task { [weak self] in
+			var attempt = 0
+			while let self, self.joinRelay === relay, !relay.closed.value, ContinuousClock.now - started < redialFor {
+				attempt += 1
+				if attempt > 1, let found = await self.find(relay.device, within: .seconds(4)) { relay.endpoint = found }
+				guard self.joinRelay === relay, !relay.closed.value else { break }
+				if await self.dial(relay, relay.endpoint, within: .seconds(5)) {
+					self.joinRedials += 1
+					self.redialTask = nil
+					note("reconnected to the host after \(elapsed(since: started)) (attempt \(attempt))")
+					return
+				}
+				try? await Task.sleep(for: .milliseconds(300))
+			}
+			guard let self else { return }
+			self.redialTask = nil
+			if self.joinRelay === relay, !relay.closed.value {
+				note("gave up reconnecting after \(elapsed(since: started))")
+				self.failJoin(relay)
+			}
+		}
+	}
+
+	/// Looks for a paired phone hosting the game, for up to `limit`.
+	private func find(_ device: UInt64, within limit: Duration) async -> WAEndpoint? {
+		guard let service = WASubscribableService.allServices[serviceName] else { return nil }
+		let search = Task { () -> WAEndpoint? in
+			let browser = NetworkBrowser(for: .wifiAware(.connecting(to: .allPairedDevices, from: service)))
+			return try? await browser.run { found in
+				if let ep = found.first(where: { $0.device.id == device }) { return .finish(ep) }
+				return .continue
+			}
+		}
+		let timer = Task {
+			try? await Task.sleep(for: limit)
+			search.cancel()
+		}
+		let ep = await search.value
+		timer.cancel()
+		return ep
+	}
+
+	private func failJoin(_ relay: JoinRelay) {
+		relay.close()
+		if joinRelay === relay {
+			redialTask?.cancel()
+			redialTask = nil
+			joinRelay = nil
 			joinState = 3
 		}
 	}
 
 	func leave() {
-		joinLink?.close()
-		joinLink = nil
+		redialTask?.cancel()
+		redialTask = nil
+		joinRelay?.close()
+		joinRelay = nil
 		joinState = 0
 	}
 

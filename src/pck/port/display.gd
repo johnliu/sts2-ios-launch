@@ -102,6 +102,7 @@ var _shots_left := -1 # -1 = unlimited (DEBUG_SHOTS), 0 = off
 var _since_shot := 0.0
 var _shot_index := 0
 var _last_rect := Rect2()
+var _background: Node = null # background_res.gd: the combat background at its art's resolution
 
 
 func _ready() -> void:
@@ -117,6 +118,8 @@ func _ready() -> void:
 	get_tree().root.size_changed.connect(_enforce)
 	get_tree().node_added.connect(_on_node_added)
 	RenderingServer.frame_pre_draw.connect(_before_draw)
+	_background = preload("res://port/background_res.gd").new()
+	add_child(_background)
 
 
 func _on_node_added(node: Node) -> void:
@@ -431,6 +434,7 @@ func _before_draw() -> void:
 			if not is_equal_approx(b.position.x, x):
 				b.position.x = x
 		i -= 1
+	_background.before_draw() # last: it follows the background to where the layout above put it
 
 
 # Hand of cards on squarer screens (an iPhone Duo; the canvas is MIN_WIDTH wide): the game spreads cards at fixed

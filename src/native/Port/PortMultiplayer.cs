@@ -198,7 +198,9 @@ static class PortMp
 			: $"joining {ip}:{Port} as player {id} (this device: {wifi ?? "no Wi-Fi"}{(tailscale != null ? ", Tailscale " + tailscale : "")})");
 		await PortNames.StartClient(ip, id);
 		var previous = PortHooks.ClientService;
+		var previousPeer = PortHooks.ClientPeer;
 		var join = screen.JoinGameAsync(new ENetClientConnectionInitializer(id, ip, Port));
+		if (nearby) _ = ExtendNearbyTimeout(previousPeer);
 		// The join makes its client service before it first waits; keep the app running while that's connected.
 		var tracked = PortHooks.ClientService;
 		if (tracked != null && tracked != previous) PortKeepAlive.Track(() => tracked.IsConnected);
@@ -261,10 +263,38 @@ static class PortMp
 		return (false, name, $"Couldn't connect to {name}. Keep the phones close, check it's still hosting, and try again.");
 	}
 
+	// Gives the joining side the 20 s the host allows its peers before dropping them (the game leaves a join at
+	// ENet's default of about 5 s), so a dropped Wi-Fi Aware link has time to reconnect (src/ios/nearby_play.swift).
+	static async Task ExtendNearbyTimeout(ENetPacketPeer? previous)
+	{
+		for (int i = 0; i < 300; i++) // 30 s
+		{
+			var peer = PortHooks.ClientPeer;
+			if (peer != null && peer != previous && GodotObject.IsInstanceValid(peer))
+			{
+				peer.SetTimeout(24, 20000, 20000); // ENetHost.DoClientHandshake's values
+				Log("nearby: the game waits up to 20 s for the host after a drop");
+				return;
+			}
+			await Wait(0.1);
+		}
+		Log("nearby: couldn't find the game's connection to lengthen its timeout");
+	}
+
+	static void LogNearbyEvents()
+	{
+		foreach (var e in PortNearby.DrainEvents()) Log("nearby: " + e);
+	}
+
 	// Closes the relay once the game has left the nearby host's session.
 	static async Task CloseNearbyWhenDone(NetClientGameService? service)
 	{
-		while (PortNearby.JoinState == 2 && service != null && service.IsConnected) await Wait(2);
+		while (PortNearby.JoinState == 2 && service != null && service.IsConnected)
+		{
+			LogNearbyEvents();
+			await Wait(1);
+		}
+		LogNearbyEvents();
 		Log($"nearby: left the host's game ({PortNearby.Status})");
 		PortNearby.Leave();
 	}
@@ -274,7 +304,12 @@ static class PortMp
 	{
 		PortNearby.Host(true);
 		Log($"nearby: hosting for paired phones ({PortNearby.Status})");
-		while (generation == _hostGeneration && service.IsConnected) await Wait(1);
+		while (generation == _hostGeneration && service.IsConnected)
+		{
+			LogNearbyEvents();
+			await Wait(1);
+		}
+		LogNearbyEvents();
 		if (generation == _hostGeneration) PortNearby.Host(false); // a newer host keeps offering
 		Log($"nearby: stopped hosting ({PortNearby.Status})");
 	}

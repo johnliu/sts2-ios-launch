@@ -307,6 +307,28 @@ else if (asm.Name.Name == "sts2")
 		Console.WriteLine($"NetClientGameService constructors set PortHooks.ClientService ({ctors.Count})");
 	}
 
+	// Remember the ENet peer a join connects with. The game leaves the joining side at ENet's default timeout (about
+	// 5 s without an answer, where the host allows its peers 20 s), and nearby play gives it the host's 20 s so a
+	// dropped Wi-Fi Aware link can reconnect (PortMultiplayer.ExtendNearbyTimeout).
+	{
+		var client = module.GetType("MegaCrit.Sts2.Core.Multiplayer.Transport.ENet.ENetClient")
+			?? throw new Exception("ENetClient not found");
+		var calls = new[] { client }.Concat(client.NestedTypes).SelectMany(t => t.Methods).Where(m => m.HasBody)
+			.SelectMany(m => m.Body.Instructions.Select(i => (m, i)))
+			.Where(x => (x.i.OpCode == OpCodes.Callvirt || x.i.OpCode == OpCodes.Call) && x.i.Operand is MethodReference r
+				&& r.Name == "ConnectToHost" && r.DeclaringType.FullName == "Godot.ENetConnection")
+			.ToList();
+		if (calls.Count != 1) throw new Exception($"ENetClient: expected one ENetConnection.ConnectToHost call, found {calls.Count}");
+		var (method, call) = calls[0];
+		var peer = Field("ClientPeer", module.ImportReference(((MethodReference)call.Operand).ReturnType));
+		var il = method.Body.GetILProcessor();
+		var dup = il.Create(OpCodes.Dup);
+		il.InsertAfter(call, dup);
+		il.InsertAfter(dup, il.Create(OpCodes.Stsfld, peer));
+		patched++;
+		Console.WriteLine($"ENetClient sets PortHooks.ClientPeer ({method.DeclaringType.Name})");
+	}
+
 	// The null platform reports player id 1 (the ENet host's id) even on a joining client, so the end-of-run
 	// progress update would credit the host's character to this device. Report the id this device joined with.
 	var nullPlayerId = Field("NullPlayerId", module.TypeSystem.UInt64);
